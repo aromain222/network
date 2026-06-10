@@ -1,0 +1,132 @@
+@import "tailwindcss";
+
+@theme inline {
+  /* Surfaces */
+  --color-bg: #111113;
+  --color-sidebar: #18181b;
+  --color-surface: #1a1a1e;
+  --color-elevated: #222226;
+  --color-edge: #2a2a2e;
+
+  /* Text */
+  --color-primary: #e8e8e8;
+  --color-secondary: #777777;
+  --color-muted: #555555;
+  --color-faint: #444444;
+
+  /* Brand */
+  --color-accent: #5B4FE8;
+  --color-accent-soft: #2a2560;
+  --color-accent-soft-text: #a89ff5;
+
+  /* Status / chart */
+  --color-blue: #378ADD;
+  --color-green: #1D9E75;
+  --color-purple: #7F77DD;
+  --color-yellow: #EF9F27;
+  --color-orange: #EF9F27;
+  --color-red: #E24B4A;
+
+  --color-amber-soft: #2e1a0e;
+  --color-amber-soft-text: #c47a3a;
+
+  --font-mono: var(--font-dm-mono), ui-monospace, monospace;
+  --font-serif: var(--font-fraunces), ui-serif, serif;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-primary);
+  font-family: var(--font-mono);
+  -webkit-font-smoothing: antialiased;
+  font-size: 13px;
+}
+
+* { border-color: var(--color-edge); }
+::selection { background: rgba(91, 79, 232, 0.35); }
+
+/* New design system page header */
+.page-title {
+  font-size: 22px;
+  font-weight: 500;
+  color: #e8e8e8;
+  letter-spacing: -0.01em;
+}
+.page-subtitle {
+  font-size: 12px;
+  color: #555;
+  margin-top: 2px;
+}
+
+/* 0.5px borders globally */
+.border, .border-t, .border-b, .border-l, .border-r,
+.border-edge, .border-surface, .border-elevated {
+  border-width: 0.5px;
+}
+
+/* Card action buttons */
+.btn-card {
+  background: #222226;
+  border: none;
+  color: #aaa;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 11px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: background 0.15s;
+}
+.btn-card:hover { background: #2a2a2e; color: #e8e8e8; }
+
+/* Primary purple button */
+.btn-primary {
+  background: #5B4FE8;
+  color: white;
+  border: none;
+  padding: 7px 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 0.15s;
+}
+.btn-primary:hover { background: #4a3fd4; }
+
+/* Outline button */
+.btn-outline {
+  background: transparent;
+  border: 0.5px solid #3a3a3e;
+  color: #ccc;
+  padding: 7px 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.15s;
+}
+.btn-outline:hover { color: #e8e8e8; border-color: #4a4a4e; }
+input, textarea, select { font-family: var(--font-mono); }
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-edge); border-radius: 3px; }
+
+.recharts-cartesian-grid-horizontal line,
+.recharts-cartesian-grid-vertical line {
+  stroke: #2a2a2e;
+  stroke-opacity: 0.6;
+}
+
+.recharts-text { fill: #777; font-size: 11px; }
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}

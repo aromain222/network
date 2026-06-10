@@ -1,0 +1,7 @@
+{
+  "crons": [
+    { "path": "/api/agent/discovery", "schedule": "0 17 * * *" },
+    { "path": "/api/agent/followup", "schedule": "0 16 * * 1" },
+    { "path": "/api/agent/reengage", "schedule": "0 16 * * 0" }
+  ]
+}

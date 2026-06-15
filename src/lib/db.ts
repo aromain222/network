@@ -7,7 +7,7 @@ const DB_PATH = path.join(process.cwd(), 'data', 'network.db');
 
 let _db: Database.Database | null = null;
 
-function getDb(): Database.Database {
+export function getDb(): Database.Database {
   if (_db) return _db;
 
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -51,6 +51,21 @@ function getDb(): Database.Database {
   if (!cols.some(c => c.name === 'email')) {
     _db.exec("ALTER TABLE contacts ADD COLUMN email TEXT DEFAULT NULL");
   }
+  if (!cols.some(c => c.name === 'tier')) {
+    _db.exec("ALTER TABLE contacts ADD COLUMN tier INTEGER DEFAULT 3");
+  }
+  if (!cols.some(c => c.name === 'warmth')) {
+    _db.exec("ALTER TABLE contacts ADD COLUMN warmth TEXT DEFAULT 'cold'");
+  }
+  if (!cols.some(c => c.name === 'relevance_score')) {
+    _db.exec("ALTER TABLE contacts ADD COLUMN relevance_score REAL DEFAULT 0");
+  }
+  if (!cols.some(c => c.name === 'shared_background')) {
+    _db.exec("ALTER TABLE contacts ADD COLUMN shared_background TEXT DEFAULT NULL");
+  }
+  if (!cols.some(c => c.name === 'source')) {
+    _db.exec("ALTER TABLE contacts ADD COLUMN source TEXT DEFAULT 'crm'");
+  }
 
   _db.exec(`
     CREATE TABLE IF NOT EXISTS messages (
@@ -77,6 +92,100 @@ function getDb(): Database.Database {
       connected_at TEXT NOT NULL
     )
   `);
+
+  // Career-OS extensions: goals, outreach approval queue, opportunities, daily metrics, brief snapshots
+  _db.exec(`
+    CREATE TABLE IF NOT EXISTS goals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      label TEXT NOT NULL UNIQUE,
+      weight REAL NOT NULL DEFAULT 1.0,
+      active INTEGER NOT NULL DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS outreach_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      contact_id TEXT NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+      channel TEXT NOT NULL,
+      subject TEXT,
+      body TEXT NOT NULL,
+      angle TEXT,
+      ask TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT DEFAULT (datetime('now')),
+      approved_at TEXT,
+      sent_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS opportunities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind TEXT NOT NULL,
+      title TEXT NOT NULL,
+      company TEXT,
+      url TEXT,
+      source TEXT,
+      relevance_score REAL DEFAULT 0,
+      discovered_at TEXT DEFAULT (datetime('now')),
+      status TEXT NOT NULL DEFAULT 'open'
+    );
+
+    CREATE TABLE IF NOT EXISTS metrics_daily (
+      day TEXT PRIMARY KEY,
+      prospects_discovered INTEGER DEFAULT 0,
+      outreach_sent INTEGER DEFAULT 0,
+      replies_received INTEGER DEFAULT 0,
+      meetings_scheduled INTEGER DEFAULT 0,
+      meetings_completed INTEGER DEFAULT 0,
+      referrals_received INTEGER DEFAULT 0,
+      opportunities_generated INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS briefs (
+      day TEXT PRIMARY KEY,
+      payload TEXT NOT NULL,
+      generated_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_outreach_status ON outreach_queue(status);
+    CREATE INDEX IF NOT EXISTS idx_contacts_tier_warmth ON contacts(tier, warmth);
+  `);
+
+  // One-time backfill: infer warmth/tier from existing status so legacy rows don't
+  // all read as cold/T3. Only runs when zero non-default rows exist.
+  const needsBackfill = (_db.prepare(
+    "SELECT COUNT(*) as n FROM contacts WHERE warmth != 'cold' OR tier != 3"
+  ).get() as { n: number }).n === 0
+    && (_db.prepare('SELECT COUNT(*) as n FROM contacts').get() as { n: number }).n > 0;
+  if (needsBackfill) {
+    _db.exec(`
+      UPDATE contacts
+      SET warmth = CASE
+          WHEN status IN ('completed', 'scheduled', 'replied') THEN 'warm'
+          ELSE 'cold'
+        END,
+        tier = CASE
+          WHEN status IN ('completed', 'scheduled', 'replied') THEN 1
+          WHEN hook != '' THEN 2
+          ELSE 3
+        END
+    `);
+  }
+
+  // Seed default goals once
+  const goalCount = (_db.prepare('SELECT COUNT(*) as n FROM goals').get() as { n: number }).n;
+  if (goalCount === 0) {
+    const seed = _db.prepare('INSERT INTO goals (label, weight, active) VALUES (?, ?, 1)');
+    const defaults: Array<[string, number]> = [
+      ['AI', 1.0],
+      ['Fintech', 0.9],
+      ['Venture Capital', 0.7],
+      ['Forward Deployed Engineering', 1.0],
+      ['Solutions Architecture', 0.95],
+      ['Product Management', 0.85],
+      ['Startup Operations', 0.7],
+      ['Customer-Facing Technical Roles', 0.95],
+    ];
+    for (const [label, weight] of defaults) seed.run(label, weight);
+  }
 
   const count = (_db.prepare('SELECT COUNT(*) as n FROM contacts').get() as { n: number }).n;
   if (count === 0) {
@@ -105,6 +214,8 @@ function getDb(): Database.Database {
 }
 
 function rowToContact(row: Record<string, unknown>): Contact {
+  const warmth = (row.warmth as Contact['warmth']) || 'cold';
+  const tier = (row.tier as Contact['tier']) ?? 3;
   return {
     ...(row as unknown as Contact),
     tags: JSON.parse(row.tags as string),
@@ -113,7 +224,18 @@ function rowToContact(row: Record<string, unknown>): Contact {
     met_date: (row.met_date as string) || undefined,
     phone: (row.phone as string) || undefined,
     email: (row.email as string) || undefined,
+    tier,
+    warmth,
+    relevance_score: (row.relevance_score as number) ?? 0,
+    shared_background: (row.shared_background as string) || undefined,
+    source: (row.source as string) || 'crm',
   };
+}
+
+export { rowToContact };
+
+export function today(): string {
+  return new Date().toISOString().slice(0, 10);
 }
 
 export function getAllContacts(): Contact[] {

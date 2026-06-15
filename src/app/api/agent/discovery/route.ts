@@ -9,10 +9,12 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
   const result = await runDiscovery('cron');
-  return NextResponse.json(result, { status: result.run.success ? 200 : 502 });
+  const status = result.run.success ? 200 : result.discovery ? 207 : 502;
+  return NextResponse.json(result, { status });
 }
 
 export async function POST() {
   const result = await runDiscovery('manual');
-  return NextResponse.json(result, { status: result.run.success ? 200 : 502 });
+  const status = result.run.success ? 200 : result.discovery ? 207 : 502;
+  return NextResponse.json(result, { status });
 }

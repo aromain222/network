@@ -36,6 +36,9 @@ export function getDiscovery(): DiscoveryData | null {
   if (!discovery) return null;
   return {
     ...discovery,
+    email_error: /own email address/i.test(discovery.email_error || '')
+      ? undefined
+      : discovery.email_error,
     people: discovery.people.map(person => ({
       ...person,
       verified: Boolean(person.source_url && person.verified),

@@ -44,6 +44,13 @@ function hookClass(hook: string) {
   return 'bg-accent/15 text-accent';
 }
 
+function friendlyAgentError(value: string): string {
+  if (/rate_limit_error|status.?429|\b429\b/i.test(value)) {
+    return 'Anthropic discovery is temporarily rate-limited. Your previous verified list was kept. Try again in about a minute.';
+  }
+  return value;
+}
+
 function MessageOption({
   label,
   message,
@@ -108,9 +115,10 @@ export default function DiscoveryPage() {
       const response = await fetch(endpoint, { method: 'POST' });
       const data = await response.json();
       if (!response.ok && response.status !== 207) {
-        throw new Error(data.run?.error || data.error || 'Agent run failed');
+        throw new Error(friendlyAgentError(data.run?.error || data.error || 'Agent run failed'));
       }
       await load();
+      if (data.run?.error) setError(friendlyAgentError(data.run.error));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Agent run failed');
     } finally {

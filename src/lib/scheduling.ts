@@ -13,6 +13,8 @@ export type Hint = {
   startOffset?: number;
   endOffset?: number;
   preferDays?: number[];
+  minHour?: number;
+  maxHour?: number;
 };
 
 export type Slot = { date: string; day: string; time: string; hour: number; minute: number };
@@ -25,6 +27,74 @@ export const DEFAULT_PREFS: Prefs = {
   buffer: 30,
   blackoutDates: [],
 };
+
+export function extractSchedulingHint(value: string): string {
+  const latest = extractLatestInboundMessage(value);
+  const lines = latest.text.split('\n').map(line => line.trim());
+  const toMeIndex = lines.reduce(
+    (latest, line, index) => (/^to\s+me\b/i.test(line) ? index : latest),
+    -1,
+  );
+  const messageLines = toMeIndex >= 0 ? lines.slice(toMeIndex + 1) : lines;
+  return messageLines
+    .filter(line =>
+      line
+      && !/^(mon|tue|wed|thu|fri|sat|sun),?\s+[a-z]{3,9}\s+\d{1,2}/i.test(line)
+      && !/^\d{1,2}:\d{2}\s*(am|pm)\b/i.test(line)
+      && !/^[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){1,3}$/.test(line),
+    )
+    .join(' ');
+}
+
+export function extractLatestInboundMessage(value: string): {
+  sender: string;
+  text: string;
+} {
+  const normalized = value.replace(/\r/g, '');
+  const linkedInMarker = /(?:^|\n)([^\n]+?)\s+sent the following messages?\s+at[^\n]*\n/gi;
+  const matches = [...normalized.matchAll(linkedInMarker)];
+  if (matches.length > 0) {
+    const last = matches[matches.length - 1];
+    const sender = last[1]
+      .replace(/\s+Profile$/i, '')
+      .replace(/\s*\([^)]*\)\s*$/g, '')
+      .trim();
+    const tail = normalized.slice((last.index || 0) + last[0].length);
+    const lines = tail.split('\n').map(line => line.trim()).filter(Boolean);
+    const messageLines = lines.filter(line =>
+      !/^View .+['’]s profile/i.test(line)
+      && !new RegExp(`^${sender.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\s*\\([^)]*\\))?(?:\\s+\\d{1,2}:\\d{2}\\s*(?:AM|PM))?$`, 'i').test(line)
+      && !/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Today|Yesterday)$/i.test(line),
+    );
+    return {
+      sender,
+      text: messageLines.join('\n').trim(),
+    };
+  }
+
+  const lines = normalized.split('\n').map(line => line.trim());
+  const toMeIndex = lines.reduce(
+    (latest, line, index) => (/^to\s+me\b/i.test(line) ? index : latest),
+    -1,
+  );
+  if (toMeIndex >= 0) {
+    const headerLines = lines.slice(0, toMeIndex);
+    const sender = [...headerLines].reverse().find(line =>
+      /^[A-Z][A-Za-z'-]+(?:\s+[A-Z][A-Za-z'-]+){1,3}$/.test(line)
+      && !/^Avery Romain$/i.test(line),
+    ) || '';
+    return {
+      sender,
+      text: lines.slice(toMeIndex + 1).filter(Boolean).join('\n').trim(),
+    };
+  }
+
+  return { sender: '', text: normalized.trim() };
+}
+
+export function stripProposedTimes(value: string): string {
+  return value.replace(/\bpropose these times\s*:[\s\S]*$/i, '').trim();
+}
 
 const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
@@ -115,6 +185,17 @@ export function parseHint(text: string): Hint {
   const lower = text.toLowerCase();
   const today = new Date();
   const todayDow = today.getDay();
+  const mentionsET = /\b(et|est|edt|eastern)\b/i.test(lower);
+  const timeWindow: Pick<Hint, 'minHour' | 'maxHour'> =
+    /\bevening\b/i.test(lower)
+      ? { minHour: mentionsET ? 14 : 16 }
+      : /\bearly\s+afternoon\b/i.test(lower)
+        ? { minHour: mentionsET ? 10 : 12, maxHour: mentionsET ? 13 : 15 }
+        : /\bafternoon\b/i.test(lower)
+          ? { minHour: mentionsET ? 9 : 12 }
+          : /\bmorning\b/i.test(lower)
+            ? { maxHour: mentionsET ? 9 : 12 }
+            : {};
 
   const dayWords: Record<string, number> = { sunday: 0, sun: 0, monday: 1, mon: 1, tuesday: 2, tue: 2, tues: 2, wednesday: 3, wed: 3, thursday: 4, thu: 4, thurs: 4, friday: 5, fri: 5, saturday: 6, sat: 6 };
   const dayMatches: number[] = [];
@@ -125,27 +206,27 @@ export function parseHint(text: string): Hint {
 
   if (/\bnext\s+week\b/.test(lower)) {
     const daysToNextMon = (1 - todayDow + 7) % 7 || 7;
-    return { startOffset: daysToNextMon, endOffset: daysToNextMon + 11, preferDays: dayMatches.length ? dayMatches : undefined };
+    return { startOffset: daysToNextMon, endOffset: daysToNextMon + 11, preferDays: dayMatches.length ? dayMatches : undefined, ...timeWindow };
   }
   if (/\bthis\s+week\b/.test(lower)) {
     const daysToNextFri = (5 - todayDow + 7) % 7 || 7;
-    return { startOffset: 1, endOffset: daysToNextFri + 7, preferDays: dayMatches.length ? dayMatches : undefined };
+    return { startOffset: 1, endOffset: daysToNextFri + 7, preferDays: dayMatches.length ? dayMatches : undefined, ...timeWindow };
   }
   if (/\bin\s+(two|2|a\s+couple|couple)\s+weeks?\b/.test(lower)) {
     const daysToNextMon = (1 - todayDow + 7) % 7 || 7;
-    return { startOffset: daysToNextMon + 7, endOffset: daysToNextMon + 11 };
+    return { startOffset: daysToNextMon + 7, endOffset: daysToNextMon + 11, ...timeWindow };
   }
-  if (/\btomorrow\b/.test(lower)) return { startOffset: 1, endOffset: 1 };
-  if (/\btoday\b/.test(lower)) return { startOffset: 0, endOffset: 0 };
-
   if (dayMatches.length > 0) {
     const target = dayMatches[0];
     let offset = (target - todayDow + 7) % 7;
     if (offset === 0) offset = 7;
-    return { startOffset: offset, endOffset: offset, preferDays: dayMatches };
+    return { startOffset: offset, endOffset: offset, preferDays: dayMatches, ...timeWindow };
   }
 
-  return {};
+  if (/\btomorrow\b/.test(lower)) return { startOffset: 1, endOffset: 1, ...timeWindow };
+  if (/\btoday\b/.test(lower)) return { startOffset: 0, endOffset: 0, ...timeWindow };
+
+  return timeWindow;
 }
 
 export function findSlots(
@@ -232,6 +313,8 @@ export function findSlots(
 
     for (let hour = prefs.startHour; hour < prefs.endHour; hour++) {
       for (let minute = 0; minute < 60; minute += 30) {
+        if (hint.minHour !== undefined && hour < hint.minHour) continue;
+        if (hint.maxHour !== undefined && hour >= hint.maxHour) continue;
         const slotEnd = hour * 60 + minute + prefs.meetingLength;
         if (slotEnd > prefs.endHour * 60) continue;
         const conflict = dayBusy.some(b => {
@@ -257,23 +340,30 @@ export function findSlots(
   bucketEntries.sort((a, b) => a.date.localeCompare(b.date) || blockOrder[a.block] - blockOrder[b.block]);
 
   const usedDays = new Set<string>();
-  const usedBlocks = new Set<TimeBlock>();
-  const blockTargets: TimeBlock[] = ['morning', 'afternoon', 'midday'];
+  const preferredBlocks: TimeBlock[] = ['morning', 'afternoon', 'midday'];
 
-  for (const target of blockTargets) {
+  // First pass: guarantee distinct dates, varying the time of day when possible.
+  const dates = [...new Set(bucketEntries.map(entry => entry.date))];
+  for (const [index, date] of dates.entries()) {
     if (slots.length >= maxSlots) break;
-    const match = bucketEntries.find(b => b.block === target && !usedDays.has(b.date));
-    if (match) { slots.push({ date: match.date, day: match.day, time: match.time, hour: match.hour, minute: match.minute }); usedDays.add(match.date); usedBlocks.add(match.block); }
+    const preferredBlock = preferredBlocks[index % preferredBlocks.length];
+    const sameDay = bucketEntries.filter(entry => entry.date === date);
+    const match = sameDay.find(entry => entry.block === preferredBlock) || sameDay[0];
+    if (!match) continue;
+    slots.push({
+      date: match.date,
+      day: match.day,
+      time: match.time,
+      hour: match.hour,
+      minute: match.minute,
+    });
+    usedDays.add(match.date);
   }
-  for (const c of bucketEntries) {
+
+  // Only reuse a date when the search window has fewer unique available days.
+  for (const c of candidates) {
     if (slots.length >= maxSlots) break;
-    if (usedDays.has(c.date) && usedBlocks.has(c.block)) continue;
-    slots.push({ date: c.date, day: c.day, time: c.time, hour: c.hour, minute: c.minute });
-    usedDays.add(c.date); usedBlocks.add(c.block);
-  }
-  for (const c of bucketEntries) {
-    if (slots.length >= maxSlots) break;
-    if (slots.some(s => s.date === c.date && s.hour === c.hour)) continue;
+    if (slots.some(s => s.date === c.date && s.hour === c.hour && s.minute === c.minute)) continue;
     slots.push({ date: c.date, day: c.day, time: c.time, hour: c.hour, minute: c.minute });
   }
 

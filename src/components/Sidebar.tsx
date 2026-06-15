@@ -3,17 +3,20 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Users, Clock, CalendarDays, Building2, PenLine, Settings, ChevronRight, Radar } from 'lucide-react';
+import { LayoutDashboard, Users, Clock, CalendarDays, Building2, PenLine, Settings, ChevronRight, Radar, Sunrise, Inbox, Target } from 'lucide-react';
 import { getInitials } from '@/lib/utils';
 
 const NAV = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
+  { href: '/brief', label: 'Brief', icon: Sunrise },
   { href: '/discovery', label: 'Discovery', icon: Radar },
   { href: '/contacts', label: 'Contacts', icon: Users },
   { href: '/follow-ups', label: 'Follow-Ups', icon: Clock, badge: 'followup' as const },
+  { href: '/outreach', label: 'Outreach Queue', icon: Inbox, badge: 'outreach' as const },
   { href: '/calendar', label: 'Calendar', icon: CalendarDays, badge: 'calendar' as const },
   { href: '/companies', label: 'Companies', icon: Building2 },
   { href: '/compose', label: 'Compose', icon: PenLine },
+  { href: '/goals', label: 'Goals', icon: Target },
   { href: '/settings', label: 'Settings', icon: Settings },
 ];
 
@@ -21,6 +24,7 @@ export function Sidebar() {
   const pathname = usePathname();
   const [followUpCount, setFollowUpCount] = useState(0);
   const [calendarCount, setCalendarCount] = useState(0);
+  const [outreachCount, setOutreachCount] = useState(0);
 
   useEffect(() => {
     fetch('/api/contacts')
@@ -30,6 +34,10 @@ export function Sidebar() {
         const thisWeek = contacts.filter(c => c.status === 'scheduled').length;
         setCalendarCount(thisWeek);
       })
+      .catch(() => {});
+    fetch('/api/outreach?status=pending')
+      .then(r => r.ok ? r.json() : [])
+      .then((drafts: unknown[]) => setOutreachCount(Array.isArray(drafts) ? drafts.length : 0))
       .catch(() => {});
   }, [pathname]);
 
@@ -102,6 +110,17 @@ export function Sidebar() {
                   }}
                 >
                   {calendarCount}
+                </span>
+              )}
+              {item.badge === 'outreach' && outreachCount > 0 && (
+                <span
+                  style={{
+                    background: '#C8553D', color: 'white',
+                    fontSize: 10, padding: '2px 7px', borderRadius: 999,
+                    minWidth: 18, textAlign: 'center', lineHeight: 1.3,
+                  }}
+                >
+                  {outreachCount}
                 </span>
               )}
             </Link>

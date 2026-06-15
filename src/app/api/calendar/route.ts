@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getAllContacts } from '@/lib/db';
-import { findSlots, DEFAULT_PREFS, type Prefs } from '@/lib/scheduling';
+import {
+  findSlots,
+  DEFAULT_PREFS,
+  extractSchedulingHint,
+  stripProposedTimes,
+  type Prefs,
+} from '@/lib/scheduling';
 import { getCalendarBusy } from '@/lib/google';
 
 export async function POST(req: NextRequest) {
@@ -10,7 +16,7 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     prefs = { ...DEFAULT_PREFS, ...body.prefs };
-    hintText = (body.context || '') + ' ' + (body.reply || '');
+    hintText = `${stripProposedTimes(body.context || '')} ${extractSchedulingHint(body.reply || '')}`;
     overrides = body.overrides || {};
   } catch {
     // use defaults

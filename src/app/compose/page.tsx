@@ -4,6 +4,7 @@ import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { Copy, Check, Loader2, FileText, Send, MessageSquare, Mail, Upload, RefreshCw, ArrowRight, UserCheck, CalendarCheck, HelpCircle, Clock, CalendarPlus } from 'lucide-react';
 import type { Contact, ContactStatus, GenerateResponse, ReplyResponse } from '@/lib/types';
+import { extractLatestInboundMessage } from '@/lib/scheduling';
 
 export default function ComposePage() {
   return <Suspense><ComposeInner /></Suspense>;
@@ -116,6 +117,8 @@ function ComposeInner() {
 
   function detectIntent(text: string): { status: ContactStatus; label: string } {
     const lower = text.toLowerCase();
+    if (/\b(reschedule|another time|when can|can you make|could you do|what(?:'s| is) your schedule|availability|free (?:on|to)|would .* work)\b/i.test(lower))
+      return { status: 'replied', label: 'Rescheduling' };
     if (/\b(not the right|can.t help|not a fit|unfortunately|not hiring|no openings)\b/i.test(lower))
       return { status: 'no_response', label: 'Declined' };
     if (/\b(text me|email me|reach out|send me|my email|happy to chat|let.s connect|open to|call me|dm me)\b/i.test(lower))
@@ -126,8 +129,9 @@ function ComposeInner() {
     return { status: 'replied', label: 'Replied' };
   }
 
+  const latestInbound = extractLatestInboundMessage(reply);
   const matchedContact = reply.trim() ? matchContact(reply) : null;
-  const detectedIntent = reply.trim() ? detectIntent(reply) : null;
+  const detectedIntent = latestInbound.text ? detectIntent(latestInbound.text) : null;
 
   const lastAutoUpdate = useRef<string>('');
   useEffect(() => {
@@ -143,10 +147,10 @@ function ComposeInner() {
     updateContactStatus(matchedContact.id, detectedIntent.status);
   }, [matchedContact?.id, detectedIntent?.status]);
 
-  const hasSchedulingLanguage = /\b(call|meet|zoom|google meet|schedule|tuesday|wednesday|thursday|friday|monday|next week|this week|coffee|lunch|dinner|2pm|3pm|1pm|time|slot)\b/i.test(reply);
-  const askingForTimes = /\b(what time|when are you|pick a time|availability|schedule a call|when works|your schedule|free time|available)\b/i.test(reply);
+  const hasSchedulingLanguage = /\b(call|meet|zoom|google meet|schedule|tuesday|wednesday|thursday|friday|monday|next week|this week|coffee|lunch|dinner|evening|afternoon|morning|time|slot)\b/i.test(latestInbound.text);
+  const askingForTimes = /\b(what time|when are you|pick a time|availability|schedule a call|when works|your schedule|free time|available|can you make|could you do)\b/i.test(latestInbound.text);
 
-  async function findAvailableTimes() {
+  const findAvailableTimes = useCallback(async () => {
     setFindingTimes(true);
     try {
       const raw = localStorage.getItem('scheduling-prefs');
@@ -164,7 +168,22 @@ function ComposeInner() {
       setAvailableSlots(data.slots ?? []);
     } catch { setAvailableSlots([]); }
     finally { setFindingTimes(false); }
-  }
+  }, [context, reply]);
+
+  const lastAvailabilityLookup = useRef('');
+  useEffect(() => {
+    if (!askingForTimes || !reply.trim()) {
+      lastAvailabilityLookup.current = '';
+      return;
+    }
+    const key = reply.trim();
+    if (lastAvailabilityLookup.current === key) return;
+    const timer = window.setTimeout(() => {
+      lastAvailabilityLookup.current = key;
+      void findAvailableTimes();
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [askingForTimes, reply, context, findAvailableTimes]);
 
   function detectMeetingDetails(text: string): { date: string; isoDate: string; time: string; platform: string; tz: string } | null {
     if (!text) return null;
@@ -320,7 +339,7 @@ function ComposeInner() {
   const cleaned = cleanProfile(profile);
   const hookMatch = cleaned.match(/amherst|menlo|nescac|williams|bowdoin|middlebury|afrotech|nsbe|mlt|black at/i);
   const detectedHook = hookMatch ? hookMatch[0] : null;
-  const detectedEmail = reply.match(/[\w.+-]+@[\w-]+\.[\w.-]+/)?.[0] ?? null;
+  const detectedEmail = latestInbound.text.match(/[\w.+-]+@[\w-]+\.[\w.-]+/)?.[0] ?? null;
 
   async function handleCompose() {
     if (!profile.trim()) return;
@@ -352,10 +371,24 @@ function ComposeInner() {
     setLoading(true); setError(''); setReplyResult(null);
     const ctx = asEmail && detectedEmail ? `${context}\nDraft as email to ${detectedEmail}.` : context;
     try {
-      const res = await fetch('/api/reply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reply, context: ctx || undefined }) });
+      const rawPrefs = localStorage.getItem('scheduling-prefs');
+      const prefs = rawPrefs ? JSON.parse(rawPrefs) : undefined;
+      const rawOverrides = localStorage.getItem('calendar-overrides');
+      const overrides = rawOverrides ? JSON.parse(rawOverrides) : undefined;
+      const res = await fetch('/api/reply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          reply,
+          context: ctx || undefined,
+          prefs,
+          overrides,
+        }),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed');
       setReplyResult(data);
+      if (Array.isArray(data.available_slots)) setAvailableSlots(data.available_slots);
 
       // Auto-log inbound reply to the contact's conversation thread
       const cid = matchedContact?.id || manualContactId;
@@ -495,7 +528,15 @@ function ComposeInner() {
               <div className="flex-1 flex flex-col gap-3 min-h-0">
                 <div className="flex-1 flex flex-col min-h-0">
                   <label className="block text-[10px] text-secondary mb-1.5 uppercase tracking-wider shrink-0">Reply received</label>
-                  <textarea value={reply} onChange={e => setReply(e.target.value)} className={`${inputClass} flex-1 resize-y`} placeholder='"Hey Avery, happy to chat. Email me at john@company.com"' />
+                  <textarea
+                    value={reply}
+                    onChange={e => {
+                      setReply(e.target.value);
+                      setAvailableSlots([]);
+                    }}
+                    className={`${inputClass} flex-1 resize-y`}
+                    placeholder='"Hey Avery, happy to chat. Email me at john@company.com"'
+                  />
                 </div>
                 <div>
                   <label className="block text-[10px] text-secondary mb-1.5 uppercase tracking-wider">Context (optional)</label>

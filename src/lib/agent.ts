@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { Resend } from 'resend';
-import { appendAgentRun, saveDiscovery } from './agent-store';
+import { appendAgentRun, getAgentLog, getDiscovery, saveDiscovery } from './agent-store';
 import {
   createContact,
   findContactByName,
@@ -20,13 +20,24 @@ import type {
 import type { Contact } from './types';
 
 const MODEL = 'claude-sonnet-4-6';
+const DISCOVERY_MODEL = process.env.AGENT_DISCOVERY_MODEL || 'claude-haiku-4-5';
+const DISCOVERY_EXTRACTION_MODEL = process.env.AGENT_DISCOVERY_EXTRACTION_MODEL || MODEL;
 const APP_URL = process.env.APP_URL || 'http://localhost:3001';
 const TARGET_EMAIL = process.env.AGENT_EMAIL || 'averyromain5@gmail.com';
 const FROM_EMAIL = process.env.AGENT_FROM_EMAIL || 'Network HQ <onboarding@resend.dev>';
+const DAILY_DISCOVERY_TARGET = 25;
 
 export const AGENT_SYSTEM_PROMPT = `You are a networking agent for Avery Romain, a junior (Class of 2027) at Amherst College studying Political Science. He is Black, plays football at Amherst, and is from the Bay Area (attended Menlo School). He is interning at Murj as an AI Finance Architect this summer.
 
 His interests: Forward Deployed Engineering, Solutions Architecture, Sales Engineering, fintech, AI, and customer-facing product roles.
+
+Relevant background from Avery's resume:
+- Founder and lead developer of CapitalBase, an AI hedge fund research platform
+- Built multi-agent investment research, AI analyst chat, and live market-data workflows
+- Experience in private equity at Caprae Capital, fintech at Weel and SoFi, and private wealth management at Robertson Stephens
+- NCAA football student-athlete at Amherst
+- Leads Black alumni business outreach for the Amherst Black Business Club
+- Studies Political Science and Black Studies
 
 His target companies: Ramp, Retool, Palantir, Stripe, Anthropic, Cohere, Glean, Databricks, Snowflake, Harvey, Brex, Plaid, Rippling, Scale AI, Modern Treasury, Carta, Bland AI, Decagon, Writer AI, HappyRobot, dbt Labs, Voiceflow, Samsara, Notion, Airtable.
 
@@ -42,6 +53,13 @@ His hooks, strongest to weakest:
 
 Message rules:
 - Keep LinkedIn outreach concise, usually 25-70 words and never over 100 words
+- Introduce the sender naturally with his name and exactly one relevant background detail
+- For AI builders, engineers, FDEs, founders, or product leaders, prefer "I'm Avery, founder of an AI investing platform"
+- For fintech or investing contacts, prefer "I'm Avery, a junior at Amherst with experience across fintech and investing"
+- For Amherst contacts, prefer "I'm Avery, a junior at Amherst"
+- Use Menlo, football, Black alumni outreach, or Murj only when directly relevant
+- Never combine more than one Avery background description
+- Introduce Avery exactly once, in the first sentence
 - Open with the strongest hook
 - Never use em dashes
 - Never say "I came across your profile", "pick your brain", "synergize", or "hope this finds you well"
@@ -61,6 +79,20 @@ type DraftPair = {
   name: string;
   message_a: string;
   message_b: string;
+};
+
+type DiscoveryCandidate = {
+  seed: DiscoverySeed;
+  draft: DraftPair;
+};
+
+type DiscoveryLeadResponse = Partial<DiscoverySeed> | Partial<DiscoverySeed>[] | null;
+
+type DiscoverySearchResult = {
+  company: string;
+  leads: DiscoverySeed[];
+  model_candidates: number;
+  search_sources: number;
 };
 
 type EmailResult = {
@@ -96,6 +128,25 @@ async function withRetry<T>(operation: () => Promise<T>): Promise<T> {
     await sleep(5000);
     return operation();
   }
+}
+
+async function withDiscoveryRateRetry<T>(operation: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      const rateLimited = error instanceof Anthropic.RateLimitError
+        || (
+          typeof error === 'object'
+          && error !== null
+          && 'status' in error
+          && error.status === 429
+        );
+      if (!rateLimited || attempt === 2) throw error;
+      await sleep(20000 * (attempt + 1));
+    }
+  }
+  throw new Error('Discovery retry exhausted');
 }
 
 function anthropicClient() {
@@ -166,7 +217,21 @@ async function sendDigest(subject: string, html: string, text: string): Promise<
       html,
       text,
     });
-    if (error) return { sent: false, error: error.message };
+    if (error) {
+      const testRecipient = error.message.match(/own email address \(([^)]+)\)/i)?.[1];
+      if (testRecipient && testRecipient.toLowerCase() !== TARGET_EMAIL.toLowerCase()) {
+        const retry = await resend.emails.send({
+          from: FROM_EMAIL,
+          to: testRecipient,
+          subject,
+          html,
+          text,
+        });
+        if (!retry.error) return { sent: true };
+        return { sent: false, error: retry.error.message };
+      }
+      return { sent: false, error: error.message };
+    }
     return { sent: true };
   } catch (error) {
     return { sent: false, error: error instanceof Error ? error.message : 'Unknown email error' };
@@ -179,7 +244,7 @@ function normalizeDiscoverySeed(value: Partial<DiscoverySeed>): DiscoverySeed | 
   const role = String(value.role || '').trim();
   const sourceUrl = String(value.source_url || '').trim();
   const sourceEvidence = String(value.source_evidence || '').trim();
-  if (!name || !company || !role || !sourceUrl || !sourceEvidence) return null;
+  if (!name || !company || !role || !sourceEvidence) return null;
   return {
     name,
     company,
@@ -223,69 +288,50 @@ function extractSearchSources(response: Anthropic.Message): Map<string, SearchSo
   return sources;
 }
 
-function parseDiscoveryResponse(response: Anthropic.Message): Partial<DiscoverySeed>[] {
-  const text = response.content
+function getResponseText(response: Anthropic.Message): string {
+  return response.content
     .filter(block => block.type === 'text')
     .map(block => block.text)
     .join('\n')
     .trim();
+}
+
+function parseDiscoveryResponse(response: Anthropic.Message): DiscoveryLeadResponse {
+  const text = getResponseText(response);
   try {
-    return parseJson<Partial<DiscoverySeed>[]>(text);
+    return parseJson<DiscoveryLeadResponse>(text);
   } catch {
-    const start = text.indexOf('[');
-    const end = text.lastIndexOf(']');
-    if (start === -1 || end <= start) throw new Error('Discovery response did not contain valid JSON');
-    return parseJson<Partial<DiscoverySeed>[]>(text.slice(start, end + 1));
+    const arrayStart = text.indexOf('[');
+    const arrayEnd = text.lastIndexOf(']');
+    if (arrayStart !== -1 && arrayEnd > arrayStart) {
+      return parseJson<Partial<DiscoverySeed>[]>(text.slice(arrayStart, arrayEnd + 1));
+    }
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start === -1 || end <= start) return null;
+    return parseJson<Partial<DiscoverySeed>>(text.slice(start, end + 1));
   }
 }
 
-async function discoverPeople(existingNames: string[]): Promise<DiscoverySeed[]> {
-  const today = new Date().toLocaleDateString('en-US', {
-    timeZone: 'America/Los_Angeles',
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-  });
-  const prompt = `Today is ${today}. Use web search to find one real person Avery could contact.
+async function searchVerifiedLeads(
+  targetCompany: string,
+  targetRole: string,
+  existingNames: string[],
+): Promise<DiscoverySearchResult> {
+  const searchQuery = `site:linkedin.com/in "${targetCompany}" "${targetRole}"`;
+  const researchPrompt = `Run exactly ONE web search using this people-specific query:
+${searchQuery}
 
-Prioritize target-company customer-facing operators, senior AI or fintech leaders, early-stage founders, recent FDE or solutions hires, and people at YC fintech or AI companies. Only use an Amherst, Menlo, NESCAC, or Black professional-network hook when a search result explicitly supports it.
+Do not search for general company information or open jobs. From the results, identify up to THREE named people currently working at ${targetCompany} as a ${targetRole} or a clearly equivalent title.
 
-Do not include these existing contacts: ${existingNames.slice(0, 20).join(', ')}.
+Use company pages, conference speaker bios, podcast guest pages, authored articles, and public professional profiles. Include only results that explicitly state both the person's current title and ${targetCompany}. Do not infer or guess. Do not select any of these people: ${existingNames.slice(0, 60).join(', ') || 'none'}.
 
-Accuracy rules:
-- Search the web for every candidate.
-- Include a person only when one returned source explicitly confirms their full name, current company, and current role.
-- Use the exact URL from that search result as source_url.
-- source_evidence must briefly state what the source confirms.
-- Never infer education, identity, race, affiliations, or a current job from indirect clues.
-- Exclude ambiguous, stale, conflicting, or uncertain results.
-- Return one result or an empty array. Never invent a person.
-- Do not use phrases such as "likely", "appears to be", "or GTM", or alternative titles.
-
-Return ONLY a valid JSON array:
-[
-  {
-    "name": "Full Name",
-    "company": "Company Name",
-    "role": "Current exact title supported by the source",
-    "why": "One sentence on why they are relevant",
-    "hook": "Amherst | Menlo | NESCAC | FDE | Fintech | Black Network | Founder | Senior Leader",
-    "linkedin_search": "exact search string",
-    "suggested_opening": "First sentence in Avery's voice using only verified facts",
-    "source_url": "exact URL returned by web search",
-    "source_title": "source page title",
-    "source_date": "source page date when available",
-    "source_evidence": "short statement of the name, company, and role confirmed by this source"
-  }
-]`;
-
+Write concise research notes for every supported person you find. For each person state their full name, exact current title, company, the evidence, and the source. If you find at least one supported person, you must report them. Do not return JSON yet.`;
   const client = anthropicClient();
-  const response = await client.messages.create({
-    model: MODEL,
-    max_tokens: 1200,
-    system: AGENT_SYSTEM_PROMPT,
-    messages: [{ role: 'user', content: prompt }],
+  const researchResponse = await withDiscoveryRateRetry(() => client.messages.create({
+    model: DISCOVERY_MODEL,
+    max_tokens: 700,
+    messages: [{ role: 'user', content: researchPrompt }],
     tools: [{
       type: 'web_search_20250305',
       name: 'web_search',
@@ -301,74 +347,226 @@ Return ONLY a valid JSON array:
   }, {
     timeout: 90000,
     maxRetries: 0,
-  });
-  const raw = parseDiscoveryResponse(response);
-  if (!Array.isArray(raw)) throw new Error('Discovery response was not an array');
+  }));
+  const sources = extractSearchSources(researchResponse);
+  const researchNotes = getResponseText(researchResponse);
+  const sourceList = [...sources.values()].map(source => ({
+    url: source.url,
+    title: source.title,
+    date: source.page_age,
+  }));
+  const extractionPrompt = `Convert the research notes into a verified JSON array.
 
-  const sources = extractSearchSources(response);
-  const deduped = new Map<string, DiscoverySeed>();
-  for (const item of raw) {
-    const normalized = normalizeDiscoverySeed(item);
-    if (!normalized) continue;
-    const source = sources.get(normalizeUrl(normalized.source_url || ''));
-    if (!source) continue;
-    const key = `${normalized.name}|${normalized.company}`.toLowerCase();
-    if (!deduped.has(key)) {
-      deduped.set(key, {
-        ...normalized,
-        source_url: source.url,
-        source_title: source.title,
-        source_date: source.page_age || normalized.source_date,
-      });
-    }
-  }
-  const people = [...deduped.values()].slice(0, 1);
-  if (people.length === 0) throw new Error('Discovery found no candidates with valid source evidence');
-  return people;
-}
+Target company: ${targetCompany}
+Research notes:
+${researchNotes}
 
-async function draftBatch(people: DiscoverySeed[]): Promise<DraftPair[]> {
-  const prompt = `Draft two concise LinkedIn messages for each person below.
+Allowed sources:
+${JSON.stringify(sourceList)}
 
-Rules:
-- Use only the supplied source-backed facts
-- Option A is personalized: open with source_evidence or another concrete supplied detail and ask about that detail
-- Option B is generic: focus broadly on the person's current role or field, keep it simple and low pressure, and do not repeat Option A's researched detail
-- Make Option A show research without summarizing the person's resume
-- Never infer why someone changed roles or invent a project, motivation, customer, or responsibility
-- 25-70 words per message
-- Make Option A and Option B meaningfully different
-- No em dashes
-- Mention exactly one Avery detail in each message
-- Refer to Avery only as a junior, never as a rising junior or rising senior
-- Avoid generic praise such as "inspiring", "impressive", or "stood out"
-- Return ONLY a valid JSON array in the same order
+Include up to three people only when the notes explicitly support their full name, current title, and current company. source_url must exactly match one URL in Allowed sources. Do not add facts or people.
 
-People:
-${JSON.stringify(people)}
-
-Return:
+Return only this JSON shape:
 [
   {
-    "name": "Exact input name",
-    "message_a": "Option A text only",
-    "message_b": "Option B text only"
+    "name": "Full Name",
+    "company": "${targetCompany}",
+    "role": "Exact current title stated by the source",
+    "why": "Why this role is relevant to Avery",
+    "hook": "FDE or Fintech",
+    "linkedin_search": "Full Name ${targetCompany}",
+    "suggested_opening": "A short opening using only the verified role",
+    "source_url": "Exact result URL",
+    "source_title": "Exact result title",
+    "source_date": "Date if available",
+    "source_evidence": "A concise statement of exactly what the source confirms"
   }
-]`;
-  const drafts = await completeJson<Partial<DraftPair>[]>(prompt, 3500);
-  if (!Array.isArray(drafts)) throw new Error('Draft response was not an array');
-  return drafts.map(draft => ({
-    name: String(draft.name || '').trim(),
-    message_a: cleanDraft(draft.message_a),
-    message_b: cleanDraft(draft.message_b),
+]
+
+Return [] only if the research notes contain no supported person.`;
+  const extractionResponse = await withDiscoveryRateRetry(() => client.messages.create({
+    model: DISCOVERY_EXTRACTION_MODEL,
+    max_tokens: 1000,
+    messages: [{ role: 'user', content: extractionPrompt }],
+    output_config: { effort: 'low' },
+  }, {
+    timeout: 60000,
+    maxRetries: 0,
   }));
+  const raw = parseDiscoveryResponse(extractionResponse);
+  const items = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  const onlySource = sources.size === 1 ? [...sources.values()][0] : undefined;
+  const verified = new Map<string, DiscoverySeed>();
+  for (const item of items) {
+    const normalized = normalizeDiscoverySeed(item);
+    if (!normalized) continue;
+    const requestedUrl = normalizeUrl(normalized.source_url || '');
+    const source = sources.get(requestedUrl) || onlySource;
+    if (!source) continue;
+    if (normalized.company.toLowerCase() !== targetCompany.toLowerCase()) continue;
+    if (existingNames.some(name => name.toLowerCase() === normalized.name.toLowerCase())) continue;
+    const key = normalized.name.toLowerCase();
+    if (verified.has(key)) continue;
+    verified.set(key, {
+      ...normalized,
+      source_url: source.url,
+      source_title: source.title,
+      source_date: source.page_age || normalized.source_date,
+    });
+  }
+  return {
+    company: targetCompany,
+    leads: [...verified.values()].slice(0, 3),
+    model_candidates: items.length,
+    search_sources: sources.size,
+  };
+}
+
+function fallbackDiscoveryDraft(seed: DiscoverySeed): DraftPair {
+  const firstName = seed.name.split(/\s+/)[0];
+  return {
+    name: seed.name,
+    message_a: `Hey ${firstName}, I saw you're a ${seed.role} at ${seed.company}. I'm Avery, a junior at Amherst who built an AI investing platform. I'm curious how you got into the role and what the customer-facing work looks like day to day. Would you be open to a quick chat?`,
+    message_b: `Hey ${firstName}, I'm Avery, a junior at Amherst exploring customer-facing AI and fintech roles. Your work as a ${seed.role} at ${seed.company} is directly in the space I'm trying to understand. Would you be open to connecting?`,
+  };
+}
+
+async function draftDiscoveryMessages(seeds: DiscoverySeed[]): Promise<DraftPair[]> {
+  const prompt = `Write two concise LinkedIn messages from Avery Romain to each verified person below.
+
+Verified people:
+${JSON.stringify(seeds)}
+
+Avery is a junior at Amherst who built an AI investing platform and is interested in customer-facing AI and fintech roles.
+
+Rules:
+- message_a is 30-65 words, personalized around one concrete fact in source_evidence, and asks a natural question.
+- message_b is 25-55 words, lightly personalized around their role and company.
+- Both messages must introduce him exactly once using the words "I'm Avery" plus one relevant background detail.
+- No em dashes, resume recaps, generic praise such as "impressive" or "I'm impressed", or invented facts.
+- End with a low-friction request to connect or chat.
+
+Return only a JSON array with one object per input:
+[{"name":"Exact input name","message_a":"...","message_b":"..."}]`;
+  const client = anthropicClient();
+  const response = await withRetry(() => client.messages.create({
+    model: DISCOVERY_MODEL,
+    max_tokens: Math.max(700, seeds.length * 300),
+    messages: [{ role: 'user', content: prompt }],
+  }, {
+    timeout: 60000,
+    maxRetries: 0,
+  }));
+  let raw: Partial<DraftPair>[] = [];
+  try {
+    raw = parseJson<Partial<DraftPair>[]>(getResponseText(response));
+  } catch {
+    raw = [];
+  }
+  const byName = new Map(raw.map(item => [String(item.name || '').toLowerCase(), item]));
+  return seeds.map(seed => {
+    const generated = byName.get(seed.name.toLowerCase());
+    const fallback = fallbackDiscoveryDraft(seed);
+    const messageA = cleanDraft(generated?.message_a);
+    const messageB = cleanDraft(generated?.message_b);
+    return {
+      name: seed.name,
+      message_a: isValidMessage(messageA) ? messageA : fallback.message_a,
+      message_b: isValidMessage(messageB) ? messageB : fallback.message_b,
+    };
+  });
+}
+
+async function discoverPeople(existingNames: string[], desiredCount: number): Promise<{
+  candidates: DiscoveryCandidate[];
+  searches: DiscoverySearchResult[];
+}> {
+  const targets = [
+    { company: 'Ramp', role: 'Forward Deployed Engineer' },
+    { company: 'Retool', role: 'Solutions Engineer' },
+    { company: 'Palantir', role: 'Deployment Strategist' },
+    { company: 'Stripe', role: 'Solutions Architect' },
+    { company: 'Glean', role: 'Solutions Engineer' },
+    { company: 'Databricks', role: 'Solutions Architect' },
+    { company: 'Harvey', role: 'Solutions Architect' },
+    { company: 'Brex', role: 'Solutions Architect' },
+    { company: 'Plaid', role: 'Sales Engineer' },
+    { company: 'Scale AI', role: 'Forward Deployed Engineer' },
+    { company: 'Decagon', role: 'Solutions Architect' },
+    { company: 'HappyRobot', role: 'Forward Deployed Engineer' },
+    { company: 'Anthropic', role: 'Solutions Architect' },
+    { company: 'Cohere', role: 'Solutions Architect' },
+    { company: 'Snowflake', role: 'Solutions Architect' },
+    { company: 'Modern Treasury', role: 'Solutions Engineer' },
+    { company: 'Carta', role: 'Solutions Engineer' },
+    { company: 'Bland AI', role: 'Forward Deployed Engineer' },
+    { company: 'Writer', role: 'Solutions Architect' },
+    { company: 'dbt Labs', role: 'Solutions Architect' },
+    { company: 'Voiceflow', role: 'Solutions Engineer' },
+    { company: 'Samsara', role: 'Sales Engineer' },
+    { company: 'Notion', role: 'Solutions Engineer' },
+    { company: 'Airtable', role: 'Solutions Architect' },
+    { company: 'Rippling', role: 'Solutions Consultant' },
+  ];
+  const priorRuns = getAgentLog().runs.filter(run => run.kind === 'discovery').length;
+  const offset = (
+    Math.floor(Date.now() / 86400000)
+    + priorRuns * 3
+  ) % targets.length;
+  const attempts = targets.map((_, index) => targets[(offset + index) % targets.length]);
+
+  const seeds: DiscoverySeed[] = [];
+  const searches: DiscoverySearchResult[] = [];
+  const excludedNames = [...existingNames];
+  for (const target of attempts) {
+    try {
+      const result = await searchVerifiedLeads(target.company, target.role, excludedNames);
+      searches.push(result);
+      for (const seed of result.leads) {
+        if (excludedNames.some(name => name.toLowerCase() === seed.name.toLowerCase())) continue;
+        seeds.push(seed);
+        excludedNames.unshift(seed.name);
+      }
+    } catch {
+      searches.push({
+        company: target.company,
+        leads: [],
+        model_candidates: 0,
+        search_sources: 0,
+      });
+    }
+    if (seeds.length >= desiredCount) break;
+    await sleep(1200);
+  }
+  if (seeds.length === 0) return { candidates: [], searches };
+  const selected = seeds.slice(0, desiredCount);
+  const drafts: DraftPair[] = [];
+  for (let index = 0; index < selected.length; index += 8) {
+    const batch = selected.slice(index, index + 8);
+    try {
+      drafts.push(...await draftDiscoveryMessages(batch));
+    } catch {
+      drafts.push(...batch.map(fallbackDiscoveryDraft));
+    }
+  }
+  const draftsByName = new Map(drafts.map(draft => [draft.name.toLowerCase(), draft]));
+  const candidates = selected.flatMap(seed => {
+    const draft = draftsByName.get(seed.name.toLowerCase());
+    return draft ? [{ seed, draft }] : [];
+  });
+  return { candidates, searches };
+}
+
+function isValidMessage(message: string): boolean {
+  const words = wordCount(message);
+  return Boolean(message)
+    && words >= 15
+    && words <= 85
+    && /\bI['’]m Avery\b/i.test(message);
 }
 
 function validateMessage(message: string, person: string): string {
-  const words = wordCount(message);
-  if (!message || words < 15 || words > 85) {
-    throw new Error(`Draft for ${person} was outside the required length`);
-  }
+  if (!isValidMessage(message)) throw new Error(`Draft for ${person} was invalid`);
   return message;
 }
 
@@ -427,19 +625,41 @@ export async function runDiscovery(source: AgentRunSource): Promise<{
 }> {
   const startedAt = new Date().toISOString();
   try {
-    const existingNames = getAllContacts().map(contact => contact.name);
-    const seeds = await withRetry(() => discoverPeople(existingNames));
-    const batches: DiscoverySeed[][] = [];
-    for (let index = 0; index < seeds.length; index += 5) {
-      batches.push(seeds.slice(index, index + 5));
+    const currentDiscovery = getDiscovery();
+    const retainedPeople = currentDiscovery?.date === isoDate()
+      ? currentDiscovery.people
+      : [];
+    const currentDiscoveryNames = retainedPeople.map(person => person.name);
+    const existingNames = [
+      ...currentDiscoveryNames,
+      ...getAllContacts().map(contact => contact.name),
+    ];
+    const missingCount = Math.max(0, DAILY_DISCOVERY_TARGET - retainedPeople.length);
+    if (missingCount === 0) {
+      const run = createRun('discovery', source, startedAt, {
+        total: retainedPeople.length,
+        drafted: 0,
+        retained: retainedPeople.length,
+      }, { sent: false });
+      appendAgentRun(run);
+      return { discovery: currentDiscovery || undefined, run };
     }
-    const batchResults = await Promise.all(
-      batches.map(batch => withRetry(() => draftBatch(batch))),
-    );
-    const draftsByName = new Map(batchResults.flat().map(draft => [draft.name.toLowerCase(), draft]));
-    const people: DiscoveryPerson[] = seeds.map(seed => {
-      const draft = draftsByName.get(seed.name.toLowerCase());
-      if (!draft) throw new Error(`No drafts returned for ${seed.name}`);
+    const discoveryResult = await withRetry(() => discoverPeople(existingNames, missingCount));
+    const { candidates, searches } = discoveryResult;
+    if (candidates.length === 0) {
+      const run = createRun('discovery', source, startedAt, {
+        total: 0,
+        drafted: 0,
+        retained: currentDiscovery?.people.length || 0,
+        model_candidates: searches.reduce((sum, result) => sum + result.model_candidates, 0),
+        search_sources: searches.reduce((sum, result) => sum + result.search_sources, 0),
+      }, { sent: false });
+      run.error = `No new verified people found after searching ${searches.map(result => result.company).join(', ') || 'target companies'}. The previous verified list was kept.`;
+      run.success = false;
+      appendAgentRun(run);
+      return { discovery: currentDiscovery || undefined, run };
+    }
+    const newPeople: DiscoveryPerson[] = candidates.map(({ seed, draft }) => {
       return {
         ...seed,
         id: crypto.randomUUID(),
@@ -450,11 +670,14 @@ export async function runDiscovery(source: AgentRunSource): Promise<{
         verified: true,
       };
     });
+    const people = [...retainedPeople, ...newPeople].slice(0, 25);
+    const saved = people.filter(person => person.status === 'saved').length;
+    const skipped = people.filter(person => person.status === 'skipped').length;
     const discovery: DiscoveryData = {
       date: isoDate(),
       generated_at: new Date().toISOString(),
       people,
-      stats: { total: people.length, approved: 0, skipped: 0, saved: 0 },
+      stats: { total: people.length, approved: saved, skipped, saved },
     };
     const digest = discoveryDigest(discovery);
     const email = await sendDigest(digest.subject, digest.html, digest.text);
@@ -462,12 +685,20 @@ export async function runDiscovery(source: AgentRunSource): Promise<{
     saveDiscovery(discovery);
     const run = createRun('discovery', source, startedAt, {
       total: people.length,
-      drafted: people.length,
+      drafted: newPeople.length,
+      retained: retainedPeople.length,
     }, email);
+    if (people.length < DAILY_DISCOVERY_TARGET) {
+      run.success = false;
+      run.error = `Found ${people.length} of ${DAILY_DISCOVERY_TARGET} verified people. The partial list was saved; run discovery again to continue filling it.`;
+    }
     appendAgentRun(run);
     return { discovery, run };
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Unknown discovery error';
+    const rawMessage = error instanceof Error ? error.message : 'Unknown discovery error';
+    const message = /rate_limit_error|status.?429|\b429\b/i.test(rawMessage)
+      ? 'Anthropic discovery rate limit reached. The previous verified list was kept; try again in about a minute.'
+      : rawMessage;
     const run = createRun('discovery', source, startedAt, {}, { sent: false }, message);
     appendAgentRun(run);
     return { run };

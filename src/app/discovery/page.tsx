@@ -15,8 +15,10 @@ import {
 import type {
   AgentKind,
   AgentStatus,
+  DiscoveryCategory,
   DiscoveryPerson,
 } from '@/lib/agent-types';
+import { DISCOVERY_CATEGORIES } from '@/lib/agent-types';
 
 const AGENT_LABELS: Record<AgentKind, string> = {
   discovery: 'Daily discovery',
@@ -89,6 +91,7 @@ export default function DiscoveryPage() {
   const [actionId, setActionId] = useState<string | null>(null);
   const [copied, setCopied] = useState('');
   const [error, setError] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState<DiscoveryCategory | 'All'>('All');
 
   async function load() {
     const response = await fetch('/api/agent/status', { cache: 'no-store' });
@@ -234,6 +237,14 @@ export default function DiscoveryPage() {
         <p className="mt-2 text-[10px] text-muted">New leads require a live source confirming the person&apos;s current company and role. Unverified legacy cards cannot be copied or saved.</p>
       </div>
 
+      {discovery?.people.length ? (
+        <CategoryFilter
+          people={discovery.people}
+          value={categoryFilter}
+          onChange={setCategoryFilter}
+        />
+      ) : null}
+
       {!discovery?.people.length ? (
         <div className="rounded-lg border-2 border-dashed border-edge py-20 text-center">
           <Search size={24} className="mx-auto text-muted/50 mb-3" />
@@ -242,7 +253,9 @@ export default function DiscoveryPage() {
         </div>
       ) : (
         <div className="grid grid-cols-2 gap-4">
-          {discovery.people.map(person => (
+          {discovery.people
+            .filter(p => categoryFilter === 'All' || (p.category ?? 'Other') === categoryFilter)
+            .map(person => (
             <article
               key={person.id}
               className={`rounded-lg border bg-surface p-4 space-y-3 ${person.status === 'pending' ? 'border-edge' : 'border-accent/20 opacity-75'}`}
@@ -320,6 +333,49 @@ export default function DiscoveryPage() {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function CategoryFilter({
+  people,
+  value,
+  onChange,
+}: {
+  people: DiscoveryPerson[];
+  value: DiscoveryCategory | 'All';
+  onChange: (v: DiscoveryCategory | 'All') => void;
+}) {
+  const counts = new Map<DiscoveryCategory | 'All', number>();
+  counts.set('All', people.length);
+  for (const cat of DISCOVERY_CATEGORIES) counts.set(cat, 0);
+  for (const p of people) {
+    const cat = (p.category ?? 'Other') as DiscoveryCategory;
+    counts.set(cat, (counts.get(cat) ?? 0) + 1);
+  }
+  const visible: Array<DiscoveryCategory | 'All'> = ['All', ...DISCOVERY_CATEGORIES.filter(c => (counts.get(c) ?? 0) > 0)];
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {visible.map(cat => {
+        const active = value === cat;
+        const count = counts.get(cat) ?? 0;
+        return (
+          <button
+            key={cat}
+            onClick={() => onChange(cat)}
+            className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] transition-colors ${
+              active
+                ? 'bg-accent text-white'
+                : 'bg-surface border border-edge text-secondary hover:text-primary hover:border-[#3a3a45]'
+            }`}
+          >
+            <span>{cat}</span>
+            <span className={`rounded-full px-1.5 text-[10px] ${active ? 'bg-white/20' : 'bg-edge/60 text-muted'}`}>
+              {count}
+            </span>
+          </button>
+        );
+      })}
     </div>
   );
 }

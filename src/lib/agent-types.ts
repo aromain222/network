@@ -1,6 +1,27 @@
 export type AgentKind = 'discovery' | 'followup' | 'reengage';
 export type AgentRunSource = 'cron' | 'manual';
 export type DiscoveryStatus = 'pending' | 'skipped' | 'saved';
+export type DiscoveryCategory =
+  | 'Senior Executive'
+  | 'Amherst Alum'
+  | 'Menlo Alum'
+  | 'Similar Trajectory'
+  | 'Black Network'
+  | 'Target Company'
+  | 'VC/PE'
+  | 'NESCAC'
+  | 'Other';
+
+export const DISCOVERY_CATEGORIES: DiscoveryCategory[] = [
+  'Senior Executive',
+  'Amherst Alum',
+  'Menlo Alum',
+  'Similar Trajectory',
+  'Black Network',
+  'Target Company',
+  'VC/PE',
+  'NESCAC',
+];
 
 export type DiscoveryPerson = {
   id: string;
@@ -9,6 +30,7 @@ export type DiscoveryPerson = {
   role: string;
   why: string;
   hook: string;
+  category?: DiscoveryCategory;
   linkedin_search: string;
   suggested_opening: string;
   source_url?: string;

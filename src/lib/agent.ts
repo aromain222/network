@@ -14,6 +14,7 @@ import type {
   AgentKind,
   AgentRun,
   AgentRunSource,
+  DiscoveryCategory,
   DiscoveryData,
   DiscoveryPerson,
 } from './agent-types';
@@ -251,6 +252,7 @@ function normalizeDiscoverySeed(value: Partial<DiscoverySeed>): DiscoverySeed | 
     role,
     why: String(value.why || '').trim(),
     hook: String(value.hook || 'Other').trim(),
+    category: value.category,
     linkedin_search: String(value.linkedin_search || `${name} ${company}`).trim(),
     suggested_opening: cleanDraft(value.suggested_opening),
     source_url: sourceUrl,
@@ -317,6 +319,7 @@ async function searchVerifiedLeads(
   targetCompany: string,
   targetRole: string,
   existingNames: string[],
+  targetCategory?: DiscoveryCategory,
 ): Promise<DiscoverySearchResult> {
   const searchQuery = `site:linkedin.com/in "${targetCompany}" "${targetRole}"`;
   const researchPrompt = `Run exactly ONE web search using this people-specific query:
@@ -412,6 +415,7 @@ Return [] only if the research notes contain no supported person.`;
       source_url: source.url,
       source_title: source.title,
       source_date: source.page_age || normalized.source_date,
+      category: targetCategory ?? normalized.category,
     });
   }
   return {
@@ -481,46 +485,51 @@ async function planDiscoveryTargets(
   existingNames: string[],
   recentTargets: Array<{ company: string; role: string }>,
   desiredCount: number,
-): Promise<Array<{ company: string; role: string }>> {
+): Promise<Array<{ company: string; role: string; category: DiscoveryCategory; hook?: string }>> {
   const recentList = recentTargets.map(t => `${t.company} (${t.role})`).slice(0, 40).join('; ');
   const existingCompanies = Array.from(new Set(existingNames.slice(0, 80))).join(', ');
   const seed = `${new Date().toISOString().slice(0, 10)} run-${recentTargets.length}`;
 
-  const prompt = `Plan ${desiredCount + 8} distinct (company, role) targets for Avery's outreach today. Seed: ${seed}.
+  const prompt = `Today is ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. Seed: ${seed}.
 
-Avery is a junior at Amherst (Class of 2027, Political Science + Black Studies, NCAA football, Menlo School '23, Bay Area). As a student doing cold outreach, he gets a strong response rate from senior people — so prefer powerful targets across ANY industry over middle-management in his usual lanes.
+Plan ${desiredCount + 8} distinct (company, role, category) targets for Avery's outreach today.
 
-Widen the net. Industries to cover include but are not limited to:
-- AI infra / agents / enterprise SaaS (Anthropic-tier all the way down to Series A startups)
-- Fintech operators, banks, PE/VC, hedge funds, family offices, asset managers
-- Law firms (especially M&A, finance, IP)
-- Sports business and athletics (front offices of NFL/NBA/MLB/NHL teams, sports agencies, league offices, ESPN, The Athletic, NIL platforms — leans into the football angle)
-- Media, entertainment, music, film (studios, labels, streamers, agencies — CAA, WME, Spotify, Netflix, A24)
-- Consumer brands, retail, e-commerce, marketplaces
-- Climate, energy, defense, aerospace, biotech, healthcare, real estate, hospitality
-- Consulting (McKinsey, Bain, BCG and their X / digital arms)
-- Government, policy, think tanks, non-profits — fit because of his Political Science / Black Studies background
-- Black-led businesses, Black-founded venture funds, Historically Black asset managers
+Avery is a junior at Amherst College (Political Science & Black Studies), a Black student-athlete who played NCAA football, attended Menlo School (Menlo Park CA), and is interning at Murj as an AI Finance Architect this summer. He's interested in Forward Deployed Engineering, Solutions Architecture, fintech, AI, venture capital, private equity, and customer-facing product roles. As a student doing cold outreach, his response rate from senior people is high — so prefer powerful targets across any industry.
 
-Role types — seniority dominates, role variety matters:
-- C-suite (CEO, CFO, COO, CTO, CRO, CMO, CSO, Chief of Staff)
-- Founders, Co-Founders, Owners
-- VP / SVP / EVP / Managing Director / Partner / Principal
-- Head of X, Director of X, GM of X
-- Customer-facing technical roles (FDE, Solutions Architect, Sales Engineer, Customer Engineer, Deployment Strategist) — but mix these in, not the entire list
+Pull from ALL of these 8 categories, mixing seniority and fields widely:
 
-Hooks to use when relevant: Amherst alum, Menlo School alum, NESCAC, Black professional networks (BLCK VC, AfroTech, MLT, NSBE, Black at <Company>), NCAA football alumni, Bay Area, fintech + AI intersection, Murj. The hook does not have to apply — for senior cold outreach a strong specific reason is enough.
+1. **Senior Executive** — VPs, SVPs, CROs, CFOs, COOs, Managing Directors, Partners, and C-suite at mid-size companies (not mega-cap Google/Apple, but real and reachable — Series B-D startups, mid-market PE/VC, regional investment banks). People 10-25 years into their career, in a position to mentor.
+2. **Amherst Alum** — alumni in ANY relevant field (finance, tech, VC, PE, consulting, AI, entrepreneurship). Mix recent grads (0-5 years out) AND senior alumni (15+ years). Include founders of early-stage companies.
+3. **Menlo Alum** — same breadth as Amherst. Especially interesting if they played a sport.
+4. **Similar Trajectory** — student-athletes who went into finance/tech/venture. Poli sci or humanities majors who broke into AI/fintech/FDE without a technical background. People who interned at similar places (PE firms, wealth mgmt, YC) and where they ended up. Recent FDEs / SAs from non-technical backgrounds.
+5. **Black Network** — BLCK VC members, AfroTech speakers, MLT fellows, NSBE members, "Black at <Company>" ERG leads, Black founders in fintech or AI, senior Black executives at finance/tech.
+6. **Target Company** — people at Avery's targets in FDE, Solutions Engineering, or customer-facing AI roles. Targets: Ramp, Retool, Palantir, Stripe, Anthropic, Cohere, Glean, Databricks, Snowflake, Harvey, Brex, Plaid, Rippling, Scale AI, Modern Treasury, Carta, Bland AI, Decagon, Writer AI, HappyRobot, dbt Labs, Voiceflow, Samsara, Notion, Airtable.
+7. **VC/PE** — VC and PE people at mid-size or boutique firms, especially investing in AI/fintech or with an Amherst/Menlo connection.
+8. **NESCAC** — alumni from Williams, Bowdoin, Middlebury, Colby, Bates, Trinity, Wesleyan, Colgate, Hamilton, Tufts in relevant fields.
+
+Distribute the ~${desiredCount + 8} targets roughly:
+- 6-8 Senior Executive
+- 5-6 Amherst Alum + Menlo Alum (combined)
+- 4-5 Similar Trajectory
+- 3-4 Black Network
+- 3-4 Target Company (FDE/SE roles)
+- 2-3 VC/PE
+- 1-2 NESCAC
 
 Hard rules:
 - Do NOT propose targets at these companies, since Avery already has contacts there: ${existingCompanies}
 - Do NOT repeat any (company, role) from his recent runs: ${recentList || 'none yet'}
-- Vary the role types and the industries. Avoid clustering — don't pick 8 different VC Partners in a row.
-- Mix of well-known and lesser-known organizations. Roughly half should be companies / firms / teams he likely has not heard of.
-- About 60% senior decision-makers (C-suite / Founder / Partner / VP / Head / Director). About 40% customer-facing technical roles at less obvious AI / fintech companies.
+- Vary roles. Don't pick 8 different "Solutions Architect" or 8 different "Partner" picks in a row.
+- Mix of well-known and lesser-known orgs. About half should be companies he likely hasn't heard of.
 
-Return ONLY a JSON array of objects, no prose:
+Return ONLY a JSON array of objects, no prose, no markdown:
 [
-  { "company": "Exact company name", "role": "Specific title", "industry": "ai|fintech|bank|pe-vc|hedge-fund|law|consulting|consumer|media|sports|climate|healthcare|defense|real-estate|policy|education|other", "hook": "Short reason this is a fit (alumni, recent move, fund focus, market timing, etc.)" }
+  {
+    "company": "Exact company name",
+    "role": "Specific senior or customer-facing title",
+    "category": "Senior Executive|Amherst Alum|Menlo Alum|Similar Trajectory|Black Network|Target Company|VC/PE|NESCAC",
+    "hook": "Amherst / Menlo / NESCAC / FDE / Fintech / Black Network / Founder / Senior Leader / Similar Path"
+  }
 ]`;
 
   const client = anthropicClient();
@@ -534,14 +543,14 @@ Return ONLY a JSON array of objects, no prose:
   const start = text.indexOf('[');
   const end = text.lastIndexOf(']');
   if (start === -1 || end <= start) return [];
-  let raw: Array<{ company?: string; role?: string }> = [];
+  let raw: Array<{ company?: string; role?: string; category?: string; hook?: string }> = [];
   try {
-    raw = parseJson<Array<{ company?: string; role?: string }>>(text.slice(start, end + 1));
+    raw = parseJson<Array<{ company?: string; role?: string; category?: string; hook?: string }>>(text.slice(start, end + 1));
   } catch {
     return [];
   }
   const seen = new Set<string>();
-  const planned: Array<{ company: string; role: string }> = [];
+  const planned: Array<{ company: string; role: string; category: DiscoveryCategory; hook?: string }> = [];
   for (const item of raw) {
     const company = String(item.company || '').trim();
     const role = String(item.role || '').trim();
@@ -549,9 +558,28 @@ Return ONLY a JSON array of objects, no prose:
     const key = `${company.toLowerCase()}|${role.toLowerCase()}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    planned.push({ company, role });
+    planned.push({
+      company,
+      role,
+      category: normalizeCategory(item.category) ?? 'Other',
+      hook: item.hook ? String(item.hook).trim() : undefined,
+    });
   }
   return planned;
+}
+
+function normalizeCategory(raw: unknown): DiscoveryCategory | null {
+  if (!raw) return null;
+  const s = String(raw).toLowerCase();
+  if (s.includes('senior') || s.includes('exec')) return 'Senior Executive';
+  if (s.includes('amherst')) return 'Amherst Alum';
+  if (s.includes('menlo')) return 'Menlo Alum';
+  if (s.includes('similar') || s.includes('trajectory')) return 'Similar Trajectory';
+  if (s.includes('black')) return 'Black Network';
+  if (s.includes('target')) return 'Target Company';
+  if (s.includes('vc') || s.includes('pe')) return 'VC/PE';
+  if (s.includes('nescac')) return 'NESCAC';
+  return null;
 }
 
 async function discoverPeople(existingNames: string[], desiredCount: number): Promise<{
@@ -565,7 +593,7 @@ async function discoverPeople(existingNames: string[], desiredCount: number): Pr
     ? prior.people.slice(0, 40).map(p => ({ company: p.company, role: p.role }))
     : [];
 
-  let attempts: Array<{ company: string; role: string }>;
+  let attempts: Array<{ company: string; role: string; category: DiscoveryCategory; hook?: string }>;
   try {
     attempts = await planDiscoveryTargets(existingNames, recentTargets, desiredCount);
   } catch {
@@ -573,15 +601,15 @@ async function discoverPeople(existingNames: string[], desiredCount: number): Pr
   }
   if (attempts.length < Math.max(8, Math.floor(desiredCount / 2))) {
     // Fallback so a planner failure doesn't kill the run — small static seed.
-    const fallback = [
-      { company: 'Hightouch', role: 'Solutions Engineer' },
-      { company: 'Vanta', role: 'Solutions Architect' },
-      { company: 'Mercury', role: 'CFO' },
-      { company: 'General Catalyst', role: 'Principal' },
-      { company: 'Lightspeed Venture Partners', role: 'Partner' },
-      { company: 'Goldman Sachs', role: 'Vice President, Technology' },
-      { company: 'Blackstone', role: 'Managing Director' },
-      { company: 'Cravath Swaine & Moore', role: 'Partner' },
+    const fallback: Array<{ company: string; role: string; category: DiscoveryCategory }> = [
+      { company: 'Hightouch', role: 'Solutions Engineer', category: 'Target Company' },
+      { company: 'Vanta', role: 'Solutions Architect', category: 'Target Company' },
+      { company: 'Mercury', role: 'CFO', category: 'Senior Executive' },
+      { company: 'General Catalyst', role: 'Principal', category: 'VC/PE' },
+      { company: 'Lightspeed Venture Partners', role: 'Partner', category: 'VC/PE' },
+      { company: 'Goldman Sachs', role: 'Vice President, Technology', category: 'Senior Executive' },
+      { company: 'Blackstone', role: 'Managing Director', category: 'Senior Executive' },
+      { company: 'Cravath Swaine & Moore', role: 'Partner', category: 'Senior Executive' },
     ];
     const known = new Set(attempts.map(t => `${t.company.toLowerCase()}|${t.role.toLowerCase()}`));
     for (const f of fallback) {
@@ -595,7 +623,7 @@ async function discoverPeople(existingNames: string[], desiredCount: number): Pr
   const excludedNames = [...existingNames];
   for (const target of attempts) {
     try {
-      const result = await searchVerifiedLeads(target.company, target.role, excludedNames);
+      const result = await searchVerifiedLeads(target.company, target.role, excludedNames, target.category);
       searches.push(result);
       for (const seed of result.leads) {
         if (excludedNames.some(name => name.toLowerCase() === seed.name.toLowerCase())) continue;

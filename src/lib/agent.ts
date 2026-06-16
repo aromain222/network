@@ -722,14 +722,16 @@ function createRun(
   };
 }
 
-export async function runDiscovery(source: AgentRunSource): Promise<{
+export async function runDiscovery(source: AgentRunSource, opts?: { force?: boolean }): Promise<{
   discovery?: DiscoveryData;
   run: AgentRun;
 }> {
   const startedAt = new Date().toISOString();
   try {
     const currentDiscovery = getDiscovery();
-    const retainedPeople = currentDiscovery?.date === isoDate()
+    // force=true wipes today's retained list so we always plan a fresh batch.
+    // The cron path leaves force unset, so daily top-up behavior is unchanged.
+    const retainedPeople = !opts?.force && currentDiscovery?.date === isoDate()
       ? currentDiscovery.people
       : [];
     const currentDiscoveryNames = retainedPeople.map(person => person.name);

@@ -6,7 +6,7 @@ export const maxDuration = 300;
 
 export async function POST() {
   const [discovery, followup, reengage] = await Promise.all([
-    runDiscovery('manual'),
+    runDiscovery('manual', { force: true }),
     runFollowups('manual'),
     runReengagements('manual'),
   ]);

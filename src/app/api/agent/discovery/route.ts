@@ -13,8 +13,18 @@ export async function GET(request: Request) {
   return NextResponse.json(result, { status });
 }
 
-export async function POST() {
-  const result = await runDiscovery('manual');
+export async function POST(request: Request) {
+  // Manual triggers force a fresh batch by default; cron continues to top up.
+  let force = true;
+  try {
+    if (request.headers.get('content-type')?.includes('json')) {
+      const body = await request.json();
+      if (body?.force === false) force = false;
+    }
+  } catch {
+    // empty body is fine — default to force = true for manual triggers
+  }
+  const result = await runDiscovery('manual', { force });
   const status = result.run.success ? 200 : result.discovery ? 207 : 502;
   return NextResponse.json(result, { status });
 }

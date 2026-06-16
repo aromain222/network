@@ -1,6 +1,6 @@
 import { getDb, today, getAllContacts } from './db';
 import { activeGoals } from './goals';
-import { rankContacts } from './scoring';
+import { connectionStrength, isLeadership, rankBroaden, rankContacts } from './scoring';
 import { scanDormantRelationships } from './maintenance';
 import type { CareerBrief, Contact, Goal, Opportunity } from './types';
 
@@ -37,13 +37,30 @@ export async function generateBrief(day = today()): Promise<CareerBrief> {
   const internships = opps.filter(o => o.kind === 'internship').slice(0, 10);
   const fulltime = opps.filter(o => o.kind === 'fulltime').slice(0, 10);
 
-  // Section 6 — Top 25 recommended targets
-  const ranked = rankContacts(contacts, goals).slice(0, 25);
-  const recommended = ranked.map(c => ({
-    ...c,
-    reason: reasonFor(c, goals),
-    angle: angleFor(c),
-  }));
+  // Section 6 — Top 25 recommended targets, half goal-aligned + half broaden.
+  // The "broaden" half surfaces leaders (CFO, Director, Manager, VP, Founder, etc.)
+  // across any industry, prioritizing those with some connection signal.
+  const HALF = 13; // goal-aligned half
+  const BROADEN = 12; // broader/leadership half
+
+  const goalAligned = rankContacts(contacts, goals).slice(0, HALF);
+  const usedIds = new Set(goalAligned.map(c => c.id));
+
+  const broadenPool = contacts.filter(c => !usedIds.has(c.id));
+  const broaden = rankBroaden(broadenPool).slice(0, BROADEN);
+
+  const recommended = [
+    ...goalAligned.map(c => ({
+      ...c,
+      reason: reasonFor(c, goals),
+      angle: angleFor(c),
+    })),
+    ...broaden.map(c => ({
+      ...c,
+      reason: broadenReason(c),
+      angle: angleFor(c),
+    })),
+  ];
 
   const brief: CareerBrief = { day, meetings, follow_ups, health_alerts, internships, fulltime, recommended };
 
@@ -71,6 +88,23 @@ function reasonFor(c: Contact, goals: Goal[]): string {
   const hit = goals.find(g => (c.tags ?? []).some(t => t.toLowerCase().includes(g.label.toLowerCase().split(' ')[0])));
   const role = c.role ? `${c.role} at ${c.company || '—'}` : (c.company || '—');
   return hit ? `${role} — overlaps with ${hit.label} goal` : role;
+}
+
+function broadenReason(c: Contact): string {
+  const role = c.role ? `${c.role} at ${c.company || '—'}` : (c.company || '—');
+  const leader = isLeadership(c) ? ' — senior decision-maker' : '';
+  const connection = connectionLabel(c);
+  const tail = connection ? ` · ${connection}` : '';
+  return `${role}${leader}${tail}`;
+}
+
+function connectionLabel(c: Contact): string | null {
+  if (c.warmth === 'warm' || c.status === 'completed') return 'warm relationship';
+  if (c.warmth === 'second_degree' && c.shared_background) return `mutual: ${c.shared_background}`;
+  if (c.status === 'replied' || c.status === 'scheduled') return 'active thread';
+  if (c.hook) return `hook: ${c.hook}`;
+  if (c.status === 'sent' || c.status === 'followup') return 'previously contacted';
+  return null;
 }
 
 function angleFor(c: Contact): string {

@@ -477,43 +477,118 @@ Return only a JSON array with one object per input:
   });
 }
 
+async function planDiscoveryTargets(
+  existingNames: string[],
+  recentTargets: Array<{ company: string; role: string }>,
+  desiredCount: number,
+): Promise<Array<{ company: string; role: string }>> {
+  const recentList = recentTargets.map(t => `${t.company} (${t.role})`).slice(0, 40).join('; ');
+  const existingCompanies = Array.from(new Set(existingNames.slice(0, 80))).join(', ');
+  const seed = `${new Date().toISOString().slice(0, 10)} run-${recentTargets.length}`;
+
+  const prompt = `Plan ${desiredCount + 8} distinct (company, role) targets for Avery's outreach today. Seed: ${seed}.
+
+Avery is a junior at Amherst (Class of 2027, Political Science + Black Studies, NCAA football, Menlo School '23, Bay Area). As a student doing cold outreach, he gets a strong response rate from senior people — so prefer powerful targets across ANY industry over middle-management in his usual lanes.
+
+Widen the net. Industries to cover include but are not limited to:
+- AI infra / agents / enterprise SaaS (Anthropic-tier all the way down to Series A startups)
+- Fintech operators, banks, PE/VC, hedge funds, family offices, asset managers
+- Law firms (especially M&A, finance, IP)
+- Sports business and athletics (front offices of NFL/NBA/MLB/NHL teams, sports agencies, league offices, ESPN, The Athletic, NIL platforms — leans into the football angle)
+- Media, entertainment, music, film (studios, labels, streamers, agencies — CAA, WME, Spotify, Netflix, A24)
+- Consumer brands, retail, e-commerce, marketplaces
+- Climate, energy, defense, aerospace, biotech, healthcare, real estate, hospitality
+- Consulting (McKinsey, Bain, BCG and their X / digital arms)
+- Government, policy, think tanks, non-profits — fit because of his Political Science / Black Studies background
+- Black-led businesses, Black-founded venture funds, Historically Black asset managers
+
+Role types — seniority dominates, role variety matters:
+- C-suite (CEO, CFO, COO, CTO, CRO, CMO, CSO, Chief of Staff)
+- Founders, Co-Founders, Owners
+- VP / SVP / EVP / Managing Director / Partner / Principal
+- Head of X, Director of X, GM of X
+- Customer-facing technical roles (FDE, Solutions Architect, Sales Engineer, Customer Engineer, Deployment Strategist) — but mix these in, not the entire list
+
+Hooks to use when relevant: Amherst alum, Menlo School alum, NESCAC, Black professional networks (BLCK VC, AfroTech, MLT, NSBE, Black at <Company>), NCAA football alumni, Bay Area, fintech + AI intersection, Murj. The hook does not have to apply — for senior cold outreach a strong specific reason is enough.
+
+Hard rules:
+- Do NOT propose targets at these companies, since Avery already has contacts there: ${existingCompanies}
+- Do NOT repeat any (company, role) from his recent runs: ${recentList || 'none yet'}
+- Vary the role types and the industries. Avoid clustering — don't pick 8 different VC Partners in a row.
+- Mix of well-known and lesser-known organizations. Roughly half should be companies / firms / teams he likely has not heard of.
+- About 60% senior decision-makers (C-suite / Founder / Partner / VP / Head / Director). About 40% customer-facing technical roles at less obvious AI / fintech companies.
+
+Return ONLY a JSON array of objects, no prose:
+[
+  { "company": "Exact company name", "role": "Specific title", "industry": "ai|fintech|bank|pe-vc|hedge-fund|law|consulting|consumer|media|sports|climate|healthcare|defense|real-estate|policy|education|other", "hook": "Short reason this is a fit (alumni, recent move, fund focus, market timing, etc.)" }
+]`;
+
+  const client = anthropicClient();
+  const response = await withRetry(() => client.messages.create({
+    model: DISCOVERY_MODEL,
+    max_tokens: 2500,
+    messages: [{ role: 'user', content: prompt }],
+  }, { timeout: 60000, maxRetries: 0 }));
+
+  const text = getResponseText(response);
+  const start = text.indexOf('[');
+  const end = text.lastIndexOf(']');
+  if (start === -1 || end <= start) return [];
+  let raw: Array<{ company?: string; role?: string }> = [];
+  try {
+    raw = parseJson<Array<{ company?: string; role?: string }>>(text.slice(start, end + 1));
+  } catch {
+    return [];
+  }
+  const seen = new Set<string>();
+  const planned: Array<{ company: string; role: string }> = [];
+  for (const item of raw) {
+    const company = String(item.company || '').trim();
+    const role = String(item.role || '').trim();
+    if (!company || !role) continue;
+    const key = `${company.toLowerCase()}|${role.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    planned.push({ company, role });
+  }
+  return planned;
+}
+
 async function discoverPeople(existingNames: string[], desiredCount: number): Promise<{
   candidates: DiscoveryCandidate[];
   searches: DiscoverySearchResult[];
 }> {
-  const targets = [
-    { company: 'Ramp', role: 'Forward Deployed Engineer' },
-    { company: 'Retool', role: 'Solutions Engineer' },
-    { company: 'Palantir', role: 'Deployment Strategist' },
-    { company: 'Stripe', role: 'Solutions Architect' },
-    { company: 'Glean', role: 'Solutions Engineer' },
-    { company: 'Databricks', role: 'Solutions Architect' },
-    { company: 'Harvey', role: 'Solutions Architect' },
-    { company: 'Brex', role: 'Solutions Architect' },
-    { company: 'Plaid', role: 'Sales Engineer' },
-    { company: 'Scale AI', role: 'Forward Deployed Engineer' },
-    { company: 'Decagon', role: 'Solutions Architect' },
-    { company: 'HappyRobot', role: 'Forward Deployed Engineer' },
-    { company: 'Anthropic', role: 'Solutions Architect' },
-    { company: 'Cohere', role: 'Solutions Architect' },
-    { company: 'Snowflake', role: 'Solutions Architect' },
-    { company: 'Modern Treasury', role: 'Solutions Engineer' },
-    { company: 'Carta', role: 'Solutions Engineer' },
-    { company: 'Bland AI', role: 'Forward Deployed Engineer' },
-    { company: 'Writer', role: 'Solutions Architect' },
-    { company: 'dbt Labs', role: 'Solutions Architect' },
-    { company: 'Voiceflow', role: 'Solutions Engineer' },
-    { company: 'Samsara', role: 'Sales Engineer' },
-    { company: 'Notion', role: 'Solutions Engineer' },
-    { company: 'Airtable', role: 'Solutions Architect' },
-    { company: 'Rippling', role: 'Solutions Consultant' },
-  ];
-  const priorRuns = getAgentLog().runs.filter(run => run.kind === 'discovery').length;
-  const offset = (
-    Math.floor(Date.now() / 86400000)
-    + priorRuns * 3
-  ) % targets.length;
-  const attempts = targets.map((_, index) => targets[(offset + index) % targets.length]);
+  // Pull recently discovered companies from the last discovery payload so the planner
+  // explicitly avoids retargeting the same companies on consecutive runs.
+  const prior = getDiscovery();
+  const recentTargets: Array<{ company: string; role: string }> = prior?.people
+    ? prior.people.slice(0, 40).map(p => ({ company: p.company, role: p.role }))
+    : [];
+
+  let attempts: Array<{ company: string; role: string }>;
+  try {
+    attempts = await planDiscoveryTargets(existingNames, recentTargets, desiredCount);
+  } catch {
+    attempts = [];
+  }
+  if (attempts.length < Math.max(8, Math.floor(desiredCount / 2))) {
+    // Fallback so a planner failure doesn't kill the run — small static seed.
+    const fallback = [
+      { company: 'Hightouch', role: 'Solutions Engineer' },
+      { company: 'Vanta', role: 'Solutions Architect' },
+      { company: 'Mercury', role: 'CFO' },
+      { company: 'General Catalyst', role: 'Principal' },
+      { company: 'Lightspeed Venture Partners', role: 'Partner' },
+      { company: 'Goldman Sachs', role: 'Vice President, Technology' },
+      { company: 'Blackstone', role: 'Managing Director' },
+      { company: 'Cravath Swaine & Moore', role: 'Partner' },
+    ];
+    const known = new Set(attempts.map(t => `${t.company.toLowerCase()}|${t.role.toLowerCase()}`));
+    for (const f of fallback) {
+      const key = `${f.company.toLowerCase()}|${f.role.toLowerCase()}`;
+      if (!known.has(key)) attempts.push(f);
+    }
+  }
 
   const seeds: DiscoverySeed[] = [];
   const searches: DiscoverySearchResult[] = [];

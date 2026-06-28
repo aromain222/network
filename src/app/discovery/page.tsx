@@ -261,7 +261,14 @@ export default function DiscoveryPage() {
               className={`rounded-lg border bg-surface p-4 space-y-3 ${person.status === 'pending' ? 'border-edge' : 'border-accent/20 opacity-75'}`}
             >
               <div className="flex items-center justify-between">
-                <span className={`rounded-full px-2.5 py-0.5 text-[9px] ${hookClass(person.hook)}`}>{person.hook}</span>
+                <div className="flex items-center gap-1.5">
+                  <span className={`rounded-full px-2.5 py-0.5 text-[9px] ${hookClass(person.hook)}`}>{person.hook}</span>
+                  {person.interesting_score ? (
+                    <span className="rounded-full bg-bg px-2.5 py-0.5 text-[9px] text-secondary border border-edge">
+                      {person.interesting_score}/100
+                    </span>
+                  ) : null}
+                </div>
                 {person.status === 'pending' ? (
                   <button
                     onClick={() => act(person, 'skip')}
@@ -282,6 +289,14 @@ export default function DiscoveryPage() {
                 <h2 className="text-sm font-medium text-primary">{person.name}</h2>
                 <p className="text-[11px] text-secondary">{person.role} at {person.company}</p>
                 <p className="mt-2 text-[11px] leading-relaxed text-muted">Why today: {person.why}</p>
+                {person.conversation_angle && (
+                  <p className="mt-2 rounded-md border border-accent/15 bg-accent/5 px-2.5 py-2 text-[11px] leading-relaxed text-primary/85">
+                    Ask about: {person.conversation_angle}
+                  </p>
+                )}
+                {person.novelty_reason && (
+                  <p className="mt-2 text-[10px] leading-relaxed text-muted">Interesting because: {person.novelty_reason}</p>
+                )}
                 {person.verified && person.source_url ? (
                   <a
                     href={person.source_url}

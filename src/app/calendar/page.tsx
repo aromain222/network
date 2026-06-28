@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, MapPin, Video, Coffee, Check, Send, StickyNote, Loader2, Pencil, Trash2, X, Plus } from 'lucide-react';
 import { Avatar } from '@/components/Avatar';
 import type { Contact } from '@/lib/types';
+import type { Meeting } from '@/lib/db';
 
 type Platform = 'google-meet' | 'zoom' | 'in-person' | 'tbd';
 
@@ -169,6 +170,7 @@ function PlatformIcon({ platform }: { platform: Platform }) {
 export default function CalendarPage() {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [googleEvents, setGoogleEvents] = useState<GoogleEvent[]>([]);
+  const [dbMeetings, setDbMeetings] = useState<Meeting[]>([]);
   const [overrides, setOverrides] = useState<Record<string, EventOverride>>({});
   const [month, setMonth] = useState(5);
   const [year, setYear] = useState(2026);
@@ -190,6 +192,13 @@ export default function CalendarPage() {
     const res = await fetch('/api/contacts');
     if (res.ok) setContacts(await res.json());
     try {
+      const mRes = await fetch('/api/meetings');
+      if (mRes.ok) {
+        const data = await mRes.json();
+        setDbMeetings(data.meetings || []);
+      }
+    } catch { /* fine */ }
+    try {
       const gRes = await fetch('/api/google/events');
       if (gRes.ok) {
         const data = await gRes.json();
@@ -198,7 +207,14 @@ export default function CalendarPage() {
     } catch { /* not connected, fine */ }
   }, []);
 
-  useEffect(() => { load(); setOverrides(loadOverrides()); }, [load]);
+  useEffect(() => {
+    setOverrides(loadOverrides());
+    void load();
+    // Pull anything new from Google Calendar so invites/updates land here automatically
+    fetch('/api/meetings/sync', { method: 'POST' })
+      .then(() => load())
+      .catch(() => {});
+  }, [load]);
 
   const crmEvents = parseEventsFromContacts(contacts, overrides);
 
@@ -235,9 +251,58 @@ export default function CalendarPage() {
     };
   });
 
-  // Merge: keep CRM events and add Google events that don't match an existing CRM event by date+name
+  // Convert in-app meetings DB rows → CalEvent shape (confirmed only; skip proposed/cancelled)
+  const dbEventsAsCal: CalEvent[] = dbMeetings
+    .filter(m => (m.state === 'confirmed' || m.state === 'completed') && m.start_iso)
+    .map(m => {
+      const startDate = new Date(m.start_iso!);
+      const dateStr = `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}-${String(startDate.getDate()).padStart(2, '0')}`;
+      const hours = startDate.getHours();
+      const minutes = startDate.getMinutes();
+      const period = hours >= 12 ? 'PM' : 'AM';
+      const h12 = hours > 12 ? hours - 12 : hours === 0 ? 12 : hours;
+      const timeStr = `${h12}:${String(minutes).padStart(2, '0')} ${period} PT`;
+      const matched = m.contact_id ? contacts.find(c => c.id === m.contact_id) : undefined;
+      let platform: Platform = 'tbd';
+      let location = m.location || '';
+      if (m.meet_link || /meet\.google\.com/i.test(m.meet_link || '')) { platform = 'google-meet'; location = location || 'Google Meet'; }
+      else if (/zoom/i.test(m.location || '') || /zoom/i.test(m.title)) { platform = 'zoom'; location = location || 'Zoom'; }
+      else if (m.location) { platform = 'in-person'; }
+      return {
+        date: dateStr, day: startDate.getDate(),
+        contactId: matched?.id || `m-${m.id}`,
+        name: matched?.name || m.title,
+        company: matched?.company || '',
+        time: timeStr, location, platform,
+        status: m.state === 'completed' ? 'completed' : 'upcoming',
+        key: `meeting-${m.id}`,
+        source: m.source === 'google' ? 'google' : 'crm',
+        googleEventId: m.google_event_id || undefined,
+      };
+    });
+
+  // Merge: CRM events + Google events + DB meetings, deduped by googleEventId or date+name
   const crmKeys = new Set(crmEvents.map(e => `${e.date}|${e.name.toLowerCase()}`));
-  const merged = [...crmEvents, ...gEventsAsCal.filter(g => !crmKeys.has(`${g.date}|${g.name.toLowerCase()}`))];
+  const seenGoogleIds = new Set(gEventsAsCal.map(g => g.googleEventId).filter(Boolean));
+  // Also dedupe within the DB meetings themselves (manual parse + later google sync of same event)
+  const dbDeduped: CalEvent[] = [];
+  const seenDbKeys = new Set<string>();
+  for (const d of dbEventsAsCal) {
+    const key = `${d.date}|${d.name.toLowerCase()}`;
+    if (seenDbKeys.has(key)) continue;
+    seenDbKeys.add(key);
+    dbDeduped.push(d);
+  }
+  const filteredDb = dbDeduped.filter(d =>
+    !(d.googleEventId && seenGoogleIds.has(d.googleEventId))
+    && !crmKeys.has(`${d.date}|${d.name.toLowerCase()}`),
+  );
+  const dbKeys = new Set(filteredDb.map(d => `${d.date}|${d.name.toLowerCase()}`));
+  const merged = [
+    ...crmEvents,
+    ...gEventsAsCal.filter(g => !crmKeys.has(`${g.date}|${g.name.toLowerCase()}`) && !dbKeys.has(`${g.date}|${g.name.toLowerCase()}`)),
+    ...filteredDb,
+  ];
   // Tag CRM events that match a Google event as also being on Google
   for (const cm of merged) {
     if (cm.source !== 'google') {

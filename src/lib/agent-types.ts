@@ -31,6 +31,9 @@ export type DiscoveryPerson = {
   why: string;
   hook: string;
   category?: DiscoveryCategory;
+  interesting_score?: number;
+  conversation_angle?: string;
+  novelty_reason?: string;
   linkedin_search: string;
   suggested_opening: string;
   source_url?: string;

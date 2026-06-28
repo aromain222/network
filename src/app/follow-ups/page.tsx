@@ -101,6 +101,12 @@ export default function FollowUpsPage() {
             return (
               <div key={c.id} className={`rounded-lg border bg-surface p-4 ${overdue ? 'border-red/30' : 'border-edge'}`}>
                 <div className="flex items-start gap-3">
+                  <input
+                    type="checkbox"
+                    title="Mark followed up"
+                    onChange={() => handleStatus(c.id, 'completed')}
+                    className="mt-1 h-4 w-4 shrink-0 cursor-pointer accent-green"
+                  />
                   <Avatar name={c.name} size={36} />
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
@@ -116,7 +122,7 @@ export default function FollowUpsPage() {
                       <p className="text-[10px] text-secondary flex-1">{suggestedAction(c)}</p>
                       <a href={`/compose?context=${encodeURIComponent(`Following up with ${c.name} at ${c.company}. ${c.notes}`)}`}
                         className="text-[10px] text-accent hover:text-accent/80 transition-colors cursor-pointer">Draft Message</a>
-                      <button onClick={() => handleStatus(c.id, 'completed')} className="text-[10px] text-green hover:text-green/80 transition-colors cursor-pointer">Mark Complete</button>
+                      <button onClick={() => handleStatus(c.id, 'completed')} className="text-[10px] text-green hover:text-green/80 transition-colors cursor-pointer">Mark Followed Up</button>
                     </div>
                   </div>
                 </div>

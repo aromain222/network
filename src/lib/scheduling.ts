@@ -19,6 +19,46 @@ export type Hint = {
 
 export type Slot = { date: string; day: string; time: string; hour: number; minute: number };
 
+// Turn "Monday June 22, 10AM PT" into "Monday, June 22 at 10am PT"
+export function naturalizeSlotDay(day: string): string {
+  return day
+    .replace(/^(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\s+/, '$1, ')
+    .replace(/,\s*(\d{1,2}(?::\d{2})?)\s*(AM|PM)/i, (_match, time, period) => ` at ${time}${period.toLowerCase()}`);
+}
+
+// Build a prose scheduling reply, e.g.:
+//   1 slot:  "Hey Ashley, I'm free Monday, June 22 at 10am PT — whatever works best for you!"
+//   2 slots: "Hey Ashley, I'm free A or B — whatever works best for you!"
+//   3+ slots:"Hey Ashley, any of these work for me — A, B, or C. Whatever's easiest for you!"
+// When wantsET is true, each slot is suffixed with its ET equivalent.
+export function buildSchedulingProse(
+  firstName: string,
+  slots: Pick<Slot, 'day' | 'hour' | 'minute'>[],
+  wantsET = false,
+): string {
+  if (slots.length === 0) {
+    return `Hey ${firstName}, happy to find a time — what works best on your end?`;
+  }
+  const displayed = slots.map(s => {
+    const base = naturalizeSlotDay(s.day);
+    if (!wantsET) return base;
+    const etHour = (s.hour + 3) % 24;
+    const period = etHour >= 12 ? 'pm' : 'am';
+    const displayHour = etHour > 12 ? etHour - 12 : etHour === 0 ? 12 : etHour;
+    const minute = s.minute ? `:${String(s.minute).padStart(2, '0')}` : '';
+    return `${base.replace(/\s+PT$/i, '')} (${displayHour}${minute}${period} ET)`;
+  });
+  if (displayed.length === 1) {
+    return `Hey ${firstName}, I'm free ${displayed[0]} — whatever works best for you!`;
+  }
+  if (displayed.length === 2) {
+    return `Hey ${firstName}, I'm free ${displayed[0]} or ${displayed[1]} — whatever works best for you!`;
+  }
+  const last = displayed[displayed.length - 1];
+  const rest = displayed.slice(0, -1).join(', ');
+  return `Hey ${firstName}, any of these work for me — ${rest}, or ${last}. Whatever's easiest for you!`;
+}
+
 export const DEFAULT_PREFS: Prefs = {
   days: [false, true, true, true, true, true, false],
   startHour: 10,

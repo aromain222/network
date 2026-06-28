@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { Resend } from 'resend';
-import { appendAgentRun, getAgentLog, getDiscovery, saveDiscovery } from './agent-store';
+import { appendAgentRun, getDiscovery, saveDiscovery } from './agent-store';
 import {
   createContact,
   findContactByName,
@@ -69,7 +69,15 @@ Message rules:
 - Mention no more than one thing about Avery; choose the strongest hook
 - Refer to Avery as a junior at Amherst, never as a rising junior or rising senior
 - Avoid generic praise such as "inspiring", "impressive", or "stood out" unless tied to one specific supplied fact
-- Do not invent personal details that are not in the supplied data`;
+- Do not invent personal details that are not in the supplied data
+
+Background-agent quality bar:
+- Every draft must have one obvious reason it is being sent today.
+- Prefer a concrete question over a generic "would love to connect".
+- Do not write "checking in", "touching base", "following up on my note", or "wanted to circle back" unless the user explicitly asked for that phrasing.
+- If there is no real new hook, write a simple low-pressure bump instead of pretending there is new context.
+- For re-engagement, reference the last known conversation or notes if supplied. If notes are thin, ask one small update-oriented question.
+- If the draft could be sent unchanged to 50 people, rewrite it.`;
 
 type DiscoverySeed = Omit<
   DiscoveryPerson,
@@ -94,6 +102,15 @@ type DiscoverySearchResult = {
   leads: DiscoverySeed[];
   model_candidates: number;
   search_sources: number;
+};
+
+type DiscoveryTarget = {
+  company: string;
+  role: string;
+  category: DiscoveryCategory;
+  hook?: string;
+  thesis?: string;
+  priority?: number;
 };
 
 type EmailResult = {
@@ -253,6 +270,9 @@ function normalizeDiscoverySeed(value: Partial<DiscoverySeed>): DiscoverySeed | 
     why: String(value.why || '').trim(),
     hook: String(value.hook || 'Other').trim(),
     category: value.category,
+    interesting_score: clampScore(value.interesting_score),
+    conversation_angle: String(value.conversation_angle || '').trim(),
+    novelty_reason: String(value.novelty_reason || '').trim(),
     linkedin_search: String(value.linkedin_search || `${name} ${company}`).trim(),
     suggested_opening: cleanDraft(value.suggested_opening),
     source_url: sourceUrl,
@@ -260,6 +280,29 @@ function normalizeDiscoverySeed(value: Partial<DiscoverySeed>): DiscoverySeed | 
     source_date: String(value.source_date || '').trim(),
     source_evidence: sourceEvidence,
   };
+}
+
+function clampScore(value: unknown): number | undefined {
+  const score = Number(value);
+  if (!Number.isFinite(score)) return undefined;
+  return Math.max(1, Math.min(100, Math.round(score)));
+}
+
+function scoreDiscoverySeed(seed: DiscoverySeed): number {
+  let score = seed.interesting_score ?? 50;
+  const haystack = `${seed.company} ${seed.role} ${seed.hook} ${seed.why} ${seed.source_evidence} ${seed.conversation_angle} ${seed.novelty_reason}`.toLowerCase();
+
+  if (/\b(founder|co-founder|chief|cto|cpo|head of|first\s+(?:solutions|sales|gtm|product)|founding)\b/.test(haystack)) score += 12;
+  if (/\b(forward[- ]?deployed|fde|solutions engineer|solutions architect|customer engineer|sales engineer|developer relations|devrel|implementation)\b/.test(haystack)) score += 10;
+  if (/\b(ai agents?|llm|generative ai|voice ai|vertical ai|workflow automation|data infra|fintech infrastructure|payments?|risk|fraud|capital markets|healthcare ai)\b/.test(haystack)) score += 8;
+  if (/\b(amherst|menlo|football|student-athlete|black|afrotech|blck vc|mlt|nsbe|nescac)\b/.test(haystack)) score += 10;
+  if (/\b(spoke|speaker|podcast|authored|wrote|published|launched|built|scaled|led|operator)\b/.test(haystack)) score += 8;
+
+  if (/\b(analyst|associate|recruiter|talent acquisition|human resources|generic|unknown)\b/.test(haystack)) score -= 12;
+  if (!seed.conversation_angle && !seed.novelty_reason) score -= 8;
+  if (!seed.source_evidence || seed.source_evidence.length < 50) score -= 5;
+
+  return Math.max(1, Math.min(100, Math.round(score)));
 }
 
 function normalizeUrl(value: string): string {
@@ -320,6 +363,7 @@ async function searchVerifiedLeads(
   targetRole: string,
   existingNames: string[],
   targetCategory?: DiscoveryCategory,
+  targetThesis?: string,
 ): Promise<DiscoverySearchResult> {
   const searchQuery = `site:linkedin.com/in "${targetCompany}" "${targetRole}"`;
   const researchPrompt = `Run exactly ONE web search using this people-specific query:
@@ -327,9 +371,12 @@ ${searchQuery}
 
 Do not search for general company information or open jobs. From the results, identify up to THREE named people currently working at ${targetCompany} as a ${targetRole} or a clearly equivalent title.
 
-Use company pages, conference speaker bios, podcast guest pages, authored articles, and public professional profiles. Include only results that explicitly state both the person's current title and ${targetCompany}. Do not infer or guess. Do not select any of these people: ${existingNames.slice(0, 60).join(', ') || 'none'}.
+Target thesis for why this search is interesting:
+${targetThesis || 'Find people with a sharp operating, technical, investing, alumni, or identity-based angle Avery could ask about.'}
 
-Write concise research notes for every supported person you find. For each person state their full name, exact current title, company, the evidence, and the source. If you find at least one supported person, you must report them. Do not return JSON yet.`;
+Use company pages, conference speaker bios, podcast guest pages, authored articles, and public professional profiles. Include only results that explicitly state both the person's current title and ${targetCompany}. Prefer people with a distinctive conversation angle: founder/operator, first GTM or solutions hire, AI/fintech infrastructure builder, FDE/solutions leader, Amherst/Menlo/NESCAC/Black-network connection, student-athlete path, public writing/speaking, unusual career transition, or senior person at a non-obvious company. Do not infer or guess. Do not select any of these people: ${existingNames.slice(0, 60).join(', ') || 'none'}.
+
+Write concise research notes for every supported person you find. For each person state their full name, exact current title, company, the evidence, the source, and why Avery would have a real conversation with them. If you find at least one supported person, you must report them. Do not return JSON yet.`;
   const client = anthropicClient();
   const researchResponse = await withDiscoveryRateRetry(() => client.messages.create({
     model: DISCOVERY_MODEL,
@@ -375,8 +422,11 @@ Return only this JSON shape:
     "name": "Full Name",
     "company": "${targetCompany}",
     "role": "Exact current title stated by the source",
-    "why": "Why this role is relevant to Avery",
+    "why": "Why this person is worth Avery's time, not just why the role is relevant",
     "hook": "FDE or Fintech",
+    "interesting_score": 1-100,
+    "conversation_angle": "The specific question Avery should ask this person",
+    "novelty_reason": "What makes this person non-obvious or unusually valuable",
     "linkedin_search": "Full Name ${targetCompany}",
     "suggested_opening": "A short opening using only the verified role",
     "source_url": "Exact result URL",
@@ -385,6 +435,12 @@ Return only this JSON shape:
     "source_evidence": "A concise statement of exactly what the source confirms"
   }
 ]
+
+Scoring guide:
+- 90-100: unusually strong, e.g. direct Amherst/Menlo/Black network plus AI/fintech/operator angle, founder/operator at a relevant company, or senior person with a concrete public angle.
+- 75-89: clearly useful conversation with a specific role question.
+- 60-74: relevant but common.
+- Below 60: generic title, unclear conversation angle, or weak evidence.
 
 Return [] only if the research notes contain no supported person.`;
   const extractionResponse = await withDiscoveryRateRetry(() => client.messages.create({
@@ -428,10 +484,15 @@ Return [] only if the research notes contain no supported person.`;
 
 function fallbackDiscoveryDraft(seed: DiscoverySeed): DraftPair {
   const firstName = seed.name.split(/\s+/)[0];
+  const roleQuestion = /solutions|forward|deployed|sales engineer|customer/i.test(seed.role)
+    ? 'how much of the role is technical problem-solving versus working directly with customers'
+    : /invest|venture|capital|partner|principal|private equity/i.test(seed.role)
+      ? 'how you evaluate AI or fintech companies from your seat'
+      : 'what the work actually looks like up close';
   return {
     name: seed.name,
-    message_a: `Hey ${firstName}, I saw you're a ${seed.role} at ${seed.company}. I'm Avery, a junior at Amherst who built an AI investing platform. I'm curious how you got into the role and what the customer-facing work looks like day to day. Would you be open to a quick chat?`,
-    message_b: `Hey ${firstName}, I'm Avery, a junior at Amherst exploring customer-facing AI and fintech roles. Your work as a ${seed.role} at ${seed.company} is directly in the space I'm trying to understand. Would you be open to connecting?`,
+    message_a: `Hey ${firstName}, I'm Avery, a junior at Amherst exploring customer-facing AI and fintech roles. I saw you're a ${seed.role} at ${seed.company}, and I'm curious ${roleQuestion}. Would you be open to a quick chat?`,
+    message_b: `Hey ${firstName}, I'm Avery, a junior at Amherst. I'm trying to learn from people doing ${seed.role.toLowerCase()} work at companies like ${seed.company}. Would you be open to connecting?`,
   };
 }
 
@@ -444,10 +505,12 @@ ${JSON.stringify(seeds)}
 Avery is a junior at Amherst who built an AI investing platform and is interested in customer-facing AI and fintech roles.
 
 Rules:
-- message_a is 30-65 words, personalized around one concrete fact in source_evidence, and asks a natural question.
-- message_b is 25-55 words, lightly personalized around their role and company.
+- message_a is 30-65 words, personalized around one concrete fact in source_evidence, and asks a natural question that follows from that fact.
+- message_b is 25-55 words, lightly personalized around their role and company. It should still sound human, not generic.
 - Both messages must introduce him exactly once using the words "I'm Avery" plus one relevant background detail.
 - No em dashes, resume recaps, generic praise such as "impressive" or "I'm impressed", or invented facts.
+- Avoid "your background caught my eye", "your work stood out", "pick your brain", "touch base", "circle back", and "hope you're well".
+- Do not mention source_evidence unless it gives a specific product, responsibility, title, event, or career move.
 - End with a low-friction request to connect or chat.
 
 Return only a JSON array with one object per input:
@@ -485,16 +548,25 @@ async function planDiscoveryTargets(
   existingNames: string[],
   recentTargets: Array<{ company: string; role: string }>,
   desiredCount: number,
-): Promise<Array<{ company: string; role: string; category: DiscoveryCategory; hook?: string }>> {
+): Promise<DiscoveryTarget[]> {
   const recentList = recentTargets.map(t => `${t.company} (${t.role})`).slice(0, 40).join('; ');
   const existingCompanies = Array.from(new Set(existingNames.slice(0, 80))).join(', ');
   const seed = `${new Date().toISOString().slice(0, 10)} run-${recentTargets.length}`;
 
   const prompt = `Today is ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. Seed: ${seed}.
 
-Plan ${desiredCount + 8} distinct (company, role, category) targets for Avery's outreach today.
+Plan ${desiredCount + 14} distinct (company, role, category) targets for Avery's outreach today.
 
 Avery is a junior at Amherst College (Political Science & Black Studies), a Black student-athlete who played NCAA football, attended Menlo School (Menlo Park CA), and is interning at Murj as an AI Finance Architect this summer. He's interested in Forward Deployed Engineering, Solutions Architecture, fintech, AI, venture capital, private equity, and customer-facing product roles. As a student doing cold outreach, his response rate from senior people is high — so prefer powerful targets across any industry.
+
+The goal is NOT "find anyone at a target company." The goal is "find people Avery would be excited to talk to for 20 minutes." Optimize for:
+- Distinctive operators: founders, first GTM/sales/solutions hires, heads of product/solutions/FDE, customer-facing AI leaders, developer relations, implementation leaders.
+- Non-obvious companies: vertical AI, fintech infrastructure, workflow automation, healthcare/industrial AI, data infra, capital markets tech, compliance/risk/fraud infra.
+- Strong personal hooks: Amherst, Menlo, football/student-athlete, Black professional networks, NESCAC, Bay Area.
+- Conversation quality: a clear question Avery can ask that is more specific than "tell me about your path."
+- Reachability: people senior enough to help but still likely to respond to a strong student note.
+
+Deprioritize generic analysts, recruiters, mega-cap employees with no hook, broad "partner at huge firm" targets, and roles where Avery cannot ask a specific question.
 
 Pull from ALL of these 8 categories, mixing seniority and fields widely:
 
@@ -507,20 +579,21 @@ Pull from ALL of these 8 categories, mixing seniority and fields widely:
 7. **VC/PE** — VC and PE people at mid-size or boutique firms, especially investing in AI/fintech or with an Amherst/Menlo connection.
 8. **NESCAC** — alumni from Williams, Bowdoin, Middlebury, Colby, Bates, Trinity, Wesleyan, Colgate, Hamilton, Tufts in relevant fields.
 
-Distribute the ~${desiredCount + 8} targets roughly:
-- 6-8 Senior Executive
-- 5-6 Amherst Alum + Menlo Alum (combined)
-- 4-5 Similar Trajectory
-- 3-4 Black Network
-- 3-4 Target Company (FDE/SE roles)
-- 2-3 VC/PE
-- 1-2 NESCAC
+Distribute the ~${desiredCount + 14} targets roughly:
+- 5-6 Target Company / adjacent company operators in FDE, solutions, customer engineering, DevRel, implementation, or GTM strategy
+- 4-5 founders or early operators in AI/fintech/vertical software
+- 4-5 Amherst/Menlo/NESCAC/athlete/alumni hooks
+- 3-4 Black Network / Black operators or investors
+- 3-4 VC/PE people only if they invest in AI, fintech, vertical software, or have a personal hook
+- 2-3 senior executives at non-obvious companies with a crisp question
 
 Hard rules:
 - Do NOT propose targets at these companies, since Avery already has contacts there: ${existingCompanies}
 - Do NOT repeat any (company, role) from his recent runs: ${recentList || 'none yet'}
 - Vary roles. Don't pick 8 different "Solutions Architect" or 8 different "Partner" picks in a row.
-- Mix of well-known and lesser-known orgs. About half should be companies he likely hasn't heard of.
+- At least half should be people at companies outside the obvious target list.
+- Each target must include a thesis explaining why this target is interesting for Avery.
+- Add priority 1-100. 100 = most interesting and most likely to lead to a real conversation.
 
 Return ONLY a JSON array of objects, no prose, no markdown:
 [
@@ -528,7 +601,9 @@ Return ONLY a JSON array of objects, no prose, no markdown:
     "company": "Exact company name",
     "role": "Specific senior or customer-facing title",
     "category": "Senior Executive|Amherst Alum|Menlo Alum|Similar Trajectory|Black Network|Target Company|VC/PE|NESCAC",
-    "hook": "Amherst / Menlo / NESCAC / FDE / Fintech / Black Network / Founder / Senior Leader / Similar Path"
+    "hook": "Amherst / Menlo / NESCAC / FDE / Fintech / Black Network / Founder / Senior Leader / Similar Path",
+    "thesis": "Why this target is interesting enough for Avery to talk to",
+    "priority": 1-100
   }
 ]`;
 
@@ -543,14 +618,14 @@ Return ONLY a JSON array of objects, no prose, no markdown:
   const start = text.indexOf('[');
   const end = text.lastIndexOf(']');
   if (start === -1 || end <= start) return [];
-  let raw: Array<{ company?: string; role?: string; category?: string; hook?: string }> = [];
+  let raw: Array<{ company?: string; role?: string; category?: string; hook?: string; thesis?: string; priority?: number }> = [];
   try {
-    raw = parseJson<Array<{ company?: string; role?: string; category?: string; hook?: string }>>(text.slice(start, end + 1));
+    raw = parseJson<Array<{ company?: string; role?: string; category?: string; hook?: string; thesis?: string; priority?: number }>>(text.slice(start, end + 1));
   } catch {
     return [];
   }
   const seen = new Set<string>();
-  const planned: Array<{ company: string; role: string; category: DiscoveryCategory; hook?: string }> = [];
+  const planned: DiscoveryTarget[] = [];
   for (const item of raw) {
     const company = String(item.company || '').trim();
     const role = String(item.role || '').trim();
@@ -563,9 +638,11 @@ Return ONLY a JSON array of objects, no prose, no markdown:
       role,
       category: normalizeCategory(item.category) ?? 'Other',
       hook: item.hook ? String(item.hook).trim() : undefined,
+      thesis: item.thesis ? String(item.thesis).trim() : undefined,
+      priority: clampScore(item.priority) ?? 50,
     });
   }
-  return planned;
+  return planned.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
 }
 
 function normalizeCategory(raw: unknown): DiscoveryCategory | null {
@@ -593,7 +670,7 @@ async function discoverPeople(existingNames: string[], desiredCount: number): Pr
     ? prior.people.slice(0, 40).map(p => ({ company: p.company, role: p.role }))
     : [];
 
-  let attempts: Array<{ company: string; role: string; category: DiscoveryCategory; hook?: string }>;
+  let attempts: DiscoveryTarget[];
   try {
     attempts = await planDiscoveryTargets(existingNames, recentTargets, desiredCount);
   } catch {
@@ -601,15 +678,15 @@ async function discoverPeople(existingNames: string[], desiredCount: number): Pr
   }
   if (attempts.length < Math.max(8, Math.floor(desiredCount / 2))) {
     // Fallback so a planner failure doesn't kill the run — small static seed.
-    const fallback: Array<{ company: string; role: string; category: DiscoveryCategory }> = [
-      { company: 'Hightouch', role: 'Solutions Engineer', category: 'Target Company' },
-      { company: 'Vanta', role: 'Solutions Architect', category: 'Target Company' },
-      { company: 'Mercury', role: 'CFO', category: 'Senior Executive' },
-      { company: 'General Catalyst', role: 'Principal', category: 'VC/PE' },
-      { company: 'Lightspeed Venture Partners', role: 'Partner', category: 'VC/PE' },
-      { company: 'Goldman Sachs', role: 'Vice President, Technology', category: 'Senior Executive' },
-      { company: 'Blackstone', role: 'Managing Director', category: 'Senior Executive' },
-      { company: 'Cravath Swaine & Moore', role: 'Partner', category: 'Senior Executive' },
+    const fallback: DiscoveryTarget[] = [
+      { company: 'Clay', role: 'Solutions Engineer', category: 'Target Company', hook: 'FDE', thesis: 'Customer-facing automation work with a technical GTM motion.', priority: 88 },
+      { company: 'LangChain', role: 'Developer Relations', category: 'Target Company', hook: 'AI', thesis: 'Agent infrastructure plus developer-facing work Avery can ask about.', priority: 87 },
+      { company: 'Hebbia', role: 'Forward Deployed Engineer', category: 'Target Company', hook: 'FDE', thesis: 'AI workflow deployment in financial services maps directly to Avery’s interests.', priority: 86 },
+      { company: 'Rillet', role: 'Head of Solutions', category: 'Target Company', hook: 'Fintech', thesis: 'Finance automation and solutions leadership gives a concrete customer-facing fintech angle.', priority: 84 },
+      { company: 'Mercury', role: 'Product Lead, Risk', category: 'Senior Executive', hook: 'Fintech', thesis: 'Fintech infrastructure plus risk gives Avery a sharper question than generic banking.', priority: 80 },
+      { company: 'Blck VC', role: 'Investor', category: 'Black Network', hook: 'Black Network', thesis: 'Black investor community with a direct identity and investing hook.', priority: 89 },
+      { company: 'Modern Treasury', role: 'Implementation Lead', category: 'Target Company', hook: 'Fintech', thesis: 'Implementation work in payments infrastructure is a strong solutions-style path.', priority: 82 },
+      { company: 'Decagon', role: 'Forward Deployed Engineer', category: 'Target Company', hook: 'FDE', thesis: 'Customer-facing AI agent deployment is exactly the role Avery is testing.', priority: 85 },
     ];
     const known = new Set(attempts.map(t => `${t.company.toLowerCase()}|${t.role.toLowerCase()}`));
     for (const f of fallback) {
@@ -623,11 +700,17 @@ async function discoverPeople(existingNames: string[], desiredCount: number): Pr
   const excludedNames = [...existingNames];
   for (const target of attempts) {
     try {
-      const result = await searchVerifiedLeads(target.company, target.role, excludedNames, target.category);
+      const result = await searchVerifiedLeads(target.company, target.role, excludedNames, target.category, target.thesis);
       searches.push(result);
       for (const seed of result.leads) {
         if (excludedNames.some(name => name.toLowerCase() === seed.name.toLowerCase())) continue;
-        seeds.push(seed);
+        seeds.push({
+          ...seed,
+          hook: seed.hook || target.hook || 'Other',
+          category: seed.category ?? target.category,
+          novelty_reason: seed.novelty_reason || target.thesis || '',
+          interesting_score: Math.max(scoreDiscoverySeed(seed), target.priority ?? 0),
+        });
         excludedNames.unshift(seed.name);
       }
     } catch {
@@ -638,11 +721,14 @@ async function discoverPeople(existingNames: string[], desiredCount: number): Pr
         search_sources: 0,
       });
     }
-    if (seeds.length >= desiredCount) break;
+    if (seeds.length >= desiredCount + 8) break;
     await sleep(1200);
   }
   if (seeds.length === 0) return { candidates: [], searches };
-  const selected = seeds.slice(0, desiredCount);
+  const selected = seeds
+    .map(seed => ({ ...seed, interesting_score: scoreDiscoverySeed(seed) }))
+    .sort((a, b) => (b.interesting_score ?? 0) - (a.interesting_score ?? 0))
+    .slice(0, desiredCount);
   const drafts: DraftPair[] = [];
   for (let index = 0; index < selected.length; index += 8) {
     const batch = selected.slice(index, index + 8);
@@ -665,7 +751,9 @@ function isValidMessage(message: string): boolean {
   return Boolean(message)
     && words >= 15
     && words <= 85
-    && /\bI['’]m Avery\b/i.test(message);
+    && /\bI['’]m Avery\b/i.test(message)
+    && !/\b(pick your brain|hope (?:this finds you|you're well|you are well)|synergize|circle back|touching base|your background caught my eye|your work stood out|really impressive|super impressive)\b/i.test(message)
+    && !/[—]/.test(message);
 }
 
 function validateMessage(message: string, person: string): string {
@@ -683,13 +771,16 @@ function discoveryDigest(discovery: DiscoveryData) {
   const rows = discovery.people.map(person => `
     <li style="margin-bottom:16px">
       <strong>${escapeHtml(person.name)}</strong> - ${escapeHtml(person.role)} at ${escapeHtml(person.company)}<br>
+      Score: ${escapeHtml(String(person.interesting_score ?? 'n/a'))}/100<br>
       Why today: ${escapeHtml(person.why)}<br>
       Hook: ${escapeHtml(person.hook)}<br>
+      ${person.conversation_angle ? `Ask about: ${escapeHtml(person.conversation_angle)}<br>` : ''}
+      ${person.novelty_reason ? `Interesting because: ${escapeHtml(person.novelty_reason)}<br>` : ''}
       Opening: "${escapeHtml(person.suggested_opening)}"
       <br>Source: <a href="${escapeHtml(person.source_url || '')}">${escapeHtml(person.source_title || person.source_url || '')}</a>
     </li>`).join('');
   const textRows = discovery.people.map((person, index) =>
-    `${index + 1}. ${person.name} - ${person.role} at ${person.company}\nWhy today: ${person.why}\nHook: ${person.hook}\nOpening: "${person.suggested_opening}"\nSource: ${person.source_url}`,
+    `${index + 1}. ${person.name} - ${person.role} at ${person.company}\nScore: ${person.interesting_score ?? 'n/a'}/100\nWhy today: ${person.why}\nHook: ${person.hook}${person.conversation_angle ? `\nAsk about: ${person.conversation_angle}` : ''}${person.novelty_reason ? `\nInteresting because: ${person.novelty_reason}` : ''}\nOpening: "${person.suggested_opening}"\nSource: ${person.source_url}`,
   ).join('\n\n');
   return {
     subject: `${discovery.people.length} verified networking leads for ${date} - Network HQ`,
@@ -856,9 +947,25 @@ async function draftFollowups(
     days_since: days,
     hook: contact.hook,
     notes: contact.notes,
+    recent_messages: getMessages(contact.id).slice(-4).map(message => ({
+      direction: message.direction,
+      channel: message.channel,
+      body: message.body,
+      timestamp: message.timestamp,
+    })),
   }));
   const prompt = `${instructions}
-No em dashes. Use only supplied facts. Return ONLY valid JSON:
+Use the contact's notes and recent_messages to avoid generic bumps.
+Quality rules:
+- No em dashes.
+- Use only supplied facts.
+- Do not say "checking in", "touching base", "circle back", or "following up on my note".
+- Do not ask a broad "would love to connect" question unless no prior context exists.
+- If mode is followup, make the message a light bump on the original outreach with one specific reason to respond.
+- If mode is reengage, reference the prior relationship or notes and ask one small update-oriented question.
+- Sound like Avery typed it himself.
+
+Return ONLY valid JSON:
 [
   {
     "contact_id": "exact input id",
@@ -873,7 +980,7 @@ ${JSON.stringify(input)}`;
   return candidates.map(({ contact, days }) => {
     const draft = byId.get(contact.id) || '';
     const maxWords = mode === 'followup' ? 55 : 65;
-    if (!draft || wordCount(draft) > maxWords) {
+    if (!draft || wordCount(draft) > maxWords || /[—]/.test(draft) || /\b(checking in|touching base|circle back|pick your brain|hope (?:you're|you are) well)\b/i.test(draft)) {
       throw new Error(`Invalid ${mode} draft for ${contact.name}`);
     }
     return {
@@ -955,7 +1062,7 @@ export function saveDiscoveryPerson(person: DiscoveryPerson): Contact {
     status: 'sent',
     tags: ['Agent discovery'],
     hook: person.hook,
-    notes: `${person.why}\nVerified source: ${person.source_url}${person.source_evidence ? `\nEvidence: ${person.source_evidence}` : ''}`,
+    notes: `${person.why}${person.interesting_score ? `\nRecommendation score: ${person.interesting_score}/100` : ''}${person.conversation_angle ? `\nConversation angle: ${person.conversation_angle}` : ''}${person.novelty_reason ? `\nInteresting because: ${person.novelty_reason}` : ''}\nVerified source: ${person.source_url}${person.source_evidence ? `\nEvidence: ${person.source_evidence}` : ''}`,
     dateAdded: isoDate(),
     message_sent: person.message_a,
     linkedin_url: '',

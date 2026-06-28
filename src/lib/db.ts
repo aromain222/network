@@ -82,6 +82,51 @@ export function getDb(): Database.Database {
   _db.exec("CREATE INDEX IF NOT EXISTS idx_messages_contact ON messages(contact_id, timestamp)");
 
   _db.exec(`
+    CREATE TABLE IF NOT EXISTS meetings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      contact_id TEXT REFERENCES contacts(id) ON DELETE SET NULL,
+      source TEXT NOT NULL,
+      google_event_id TEXT UNIQUE,
+      state TEXT NOT NULL DEFAULT 'confirmed',
+      title TEXT NOT NULL DEFAULT '',
+      start_iso TEXT,
+      end_iso TEXT,
+      proposed_times TEXT,
+      location TEXT,
+      meet_link TEXT,
+      attendees TEXT,
+      notes TEXT NOT NULL DEFAULT '',
+      transcript TEXT NOT NULL DEFAULT '',
+      ai_summary TEXT NOT NULL DEFAULT '',
+      action_items TEXT NOT NULL DEFAULT '[]',
+      decisions TEXT NOT NULL DEFAULT '[]',
+      follow_up_draft TEXT NOT NULL DEFAULT '',
+      thank_you_sent INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_meetings_state ON meetings(state);
+    CREATE INDEX IF NOT EXISTS idx_meetings_start ON meetings(start_iso);
+    CREATE INDEX IF NOT EXISTS idx_meetings_contact ON meetings(contact_id);
+  `);
+  const meetingCols = _db.prepare("PRAGMA table_info(meetings)").all() as { name: string }[];
+  if (!meetingCols.some(c => c.name === 'transcript')) {
+    _db.exec("ALTER TABLE meetings ADD COLUMN transcript TEXT NOT NULL DEFAULT ''");
+  }
+  if (!meetingCols.some(c => c.name === 'ai_summary')) {
+    _db.exec("ALTER TABLE meetings ADD COLUMN ai_summary TEXT NOT NULL DEFAULT ''");
+  }
+  if (!meetingCols.some(c => c.name === 'action_items')) {
+    _db.exec("ALTER TABLE meetings ADD COLUMN action_items TEXT NOT NULL DEFAULT '[]'");
+  }
+  if (!meetingCols.some(c => c.name === 'decisions')) {
+    _db.exec("ALTER TABLE meetings ADD COLUMN decisions TEXT NOT NULL DEFAULT '[]'");
+  }
+  if (!meetingCols.some(c => c.name === 'follow_up_draft')) {
+    _db.exec("ALTER TABLE meetings ADD COLUMN follow_up_draft TEXT NOT NULL DEFAULT ''");
+  }
+
+  _db.exec(`
     CREATE TABLE IF NOT EXISTS google_tokens (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       access_token TEXT NOT NULL,
@@ -341,4 +386,230 @@ export function deleteMessage(id: string): void {
 
 export function deleteMessagesForContact(contactId: string): void {
   getDb().prepare('DELETE FROM messages WHERE contact_id = ?').run(contactId);
+}
+
+export type MeetingSource = 'google' | 'proposed' | 'manual';
+export type MeetingState = 'proposed' | 'confirmed' | 'completed' | 'missed' | 'cancelled';
+
+export type Meeting = {
+  id: number;
+  contact_id: string | null;
+  source: MeetingSource;
+  google_event_id: string | null;
+  state: MeetingState;
+  title: string;
+  start_iso: string | null;
+  end_iso: string | null;
+  proposed_times: string[];
+  location: string | null;
+  meet_link: string | null;
+  attendees: { email?: string; name?: string }[];
+  notes: string;
+  transcript: string;
+  ai_summary: string;
+  action_items: string[];
+  decisions: string[];
+  follow_up_draft: string;
+  thank_you_sent: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+function parseStringList(value: unknown): string[] {
+  if (typeof value !== 'string' || !value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function rowToMeeting(row: Record<string, unknown>): Meeting {
+  return {
+    id: row.id as number,
+    contact_id: (row.contact_id as string) || null,
+    source: row.source as MeetingSource,
+    google_event_id: (row.google_event_id as string) || null,
+    state: row.state as MeetingState,
+    title: (row.title as string) || '',
+    start_iso: (row.start_iso as string) || null,
+    end_iso: (row.end_iso as string) || null,
+    proposed_times: row.proposed_times ? JSON.parse(row.proposed_times as string) : [],
+    location: (row.location as string) || null,
+    meet_link: (row.meet_link as string) || null,
+    attendees: row.attendees ? JSON.parse(row.attendees as string) : [],
+    notes: (row.notes as string) || '',
+    transcript: (row.transcript as string) || '',
+    ai_summary: (row.ai_summary as string) || '',
+    action_items: parseStringList(row.action_items),
+    decisions: parseStringList(row.decisions),
+    follow_up_draft: (row.follow_up_draft as string) || '',
+    thank_you_sent: Boolean(row.thank_you_sent),
+    created_at: row.created_at as string,
+    updated_at: row.updated_at as string,
+  };
+}
+
+export function listMeetings(): Meeting[] {
+  const rows = getDb()
+    .prepare('SELECT * FROM meetings ORDER BY COALESCE(start_iso, created_at) DESC')
+    .all() as Record<string, unknown>[];
+  return rows.map(rowToMeeting);
+}
+
+export function getMeeting(id: number): Meeting | null {
+  const row = getDb().prepare('SELECT * FROM meetings WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  return row ? rowToMeeting(row) : null;
+}
+
+export function upsertGoogleMeeting(args: {
+  google_event_id: string;
+  title: string;
+  start_iso: string;
+  end_iso: string;
+  location?: string | null;
+  meet_link?: string | null;
+  attendees?: { email?: string; name?: string }[];
+  contact_id?: string | null;
+}): Meeting {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const existing = db
+    .prepare('SELECT * FROM meetings WHERE google_event_id = ?')
+    .get(args.google_event_id) as Record<string, unknown> | undefined;
+
+  if (existing) {
+    // Preserve manual edits to contact_id/state/notes/thank_you_sent
+    db.prepare(
+      `UPDATE meetings SET
+         title = ?, start_iso = ?, end_iso = ?, location = ?, meet_link = ?,
+         attendees = ?, contact_id = COALESCE(contact_id, ?), updated_at = ?
+       WHERE google_event_id = ?`
+    ).run(
+      args.title,
+      args.start_iso,
+      args.end_iso,
+      args.location ?? null,
+      args.meet_link ?? null,
+      JSON.stringify(args.attendees ?? []),
+      args.contact_id ?? null,
+      now,
+      args.google_event_id,
+    );
+    return getMeeting(existing.id as number)!;
+  }
+
+  const start = new Date(args.start_iso);
+  const initialState: MeetingState = start.getTime() < Date.now() ? 'completed' : 'confirmed';
+  const info = db.prepare(
+    `INSERT INTO meetings
+       (contact_id, source, google_event_id, state, title, start_iso, end_iso,
+        location, meet_link, attendees, created_at, updated_at)
+     VALUES (?, 'google', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    args.contact_id ?? null,
+    args.google_event_id,
+    initialState,
+    args.title,
+    args.start_iso,
+    args.end_iso,
+    args.location ?? null,
+    args.meet_link ?? null,
+    JSON.stringify(args.attendees ?? []),
+    now,
+    now,
+  );
+  return getMeeting(info.lastInsertRowid as number)!;
+}
+
+export function createProposedMeeting(args: {
+  contact_id: string | null;
+  title: string;
+  proposed_times: string[];
+  attendees?: { email?: string; name?: string }[];
+}): Meeting {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const info = db.prepare(
+    `INSERT INTO meetings
+       (contact_id, source, state, title, proposed_times, attendees, created_at, updated_at)
+     VALUES (?, 'proposed', 'proposed', ?, ?, ?, ?, ?)`
+  ).run(
+    args.contact_id,
+    args.title,
+    JSON.stringify(args.proposed_times),
+    JSON.stringify(args.attendees ?? []),
+    now,
+    now,
+  );
+  return getMeeting(info.lastInsertRowid as number)!;
+}
+
+export function createManualMeeting(args: {
+  contact_id: string | null;
+  title: string;
+  start_iso: string;
+  end_iso: string;
+  location?: string | null;
+  meet_link?: string | null;
+}): Meeting {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const info = db.prepare(
+    `INSERT INTO meetings
+       (contact_id, source, state, title, start_iso, end_iso, location, meet_link, created_at, updated_at)
+     VALUES (?, 'manual', 'confirmed', ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    args.contact_id,
+    args.title,
+    args.start_iso,
+    args.end_iso,
+    args.location ?? null,
+    args.meet_link ?? null,
+    now,
+    now,
+  );
+  return getMeeting(info.lastInsertRowid as number)!;
+}
+
+const ALLOWED_MEETING_UPDATES = new Set([
+  'contact_id', 'state', 'title', 'start_iso', 'end_iso',
+  'location', 'meet_link', 'notes', 'transcript', 'ai_summary',
+  'action_items', 'decisions', 'follow_up_draft', 'thank_you_sent',
+]);
+
+export function updateMeeting(id: number, updates: Record<string, unknown>): Meeting | null {
+  const existing = getMeeting(id);
+  if (!existing) return null;
+  const sets: string[] = [];
+  const values: unknown[] = [];
+  for (const [key, value] of Object.entries(updates)) {
+    if (!ALLOWED_MEETING_UPDATES.has(key)) continue;
+    sets.push(`${key} = ?`);
+    if (key === 'thank_you_sent') {
+      values.push(value ? 1 : 0);
+    } else if ((key === 'action_items' || key === 'decisions') && Array.isArray(value)) {
+      values.push(JSON.stringify(value));
+    } else {
+      values.push(value);
+    }
+  }
+  if (sets.length === 0) return existing;
+  sets.push("updated_at = datetime('now')");
+  values.push(id);
+  getDb().prepare(`UPDATE meetings SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+  return getMeeting(id);
+}
+
+export function deleteMeeting(id: number): void {
+  getDb().prepare('DELETE FROM meetings WHERE id = ?').run(id);
+}
+
+export function findContactByEmail(email: string): Contact | null {
+  if (!email) return null;
+  const row = getDb()
+    .prepare('SELECT * FROM contacts WHERE LOWER(email) = LOWER(?)')
+    .get(email) as Record<string, unknown> | undefined;
+  return row ? rowToContact(row) : null;
 }

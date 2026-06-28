@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Users, Clock, CalendarDays, Building2, PenLine, Settings, ChevronRight, Radar, Sunrise, Inbox, Target } from 'lucide-react';
+import { LayoutDashboard, Users, Clock, CalendarDays, Building2, PenLine, Settings, ChevronRight, Radar, Sunrise, Inbox, Target, Video } from 'lucide-react';
 import { getInitials } from '@/lib/utils';
 
 const NAV = [
@@ -14,6 +14,7 @@ const NAV = [
   { href: '/follow-ups', label: 'Follow-Ups', icon: Clock, badge: 'followup' as const },
   { href: '/outreach', label: 'Outreach Queue', icon: Inbox, badge: 'outreach' as const },
   { href: '/calendar', label: 'Calendar', icon: CalendarDays, badge: 'calendar' as const },
+  { href: '/meetings', label: 'Meetings', icon: Video, badge: 'meetings' as const },
   { href: '/companies', label: 'Companies', icon: Building2 },
   { href: '/compose', label: 'Compose', icon: PenLine },
   { href: '/goals', label: 'Goals', icon: Target },
@@ -25,6 +26,7 @@ export function Sidebar() {
   const [followUpCount, setFollowUpCount] = useState(0);
   const [calendarCount, setCalendarCount] = useState(0);
   const [outreachCount, setOutreachCount] = useState(0);
+  const [meetingsCount, setMeetingsCount] = useState(0);
 
   useEffect(() => {
     fetch('/api/contacts')
@@ -38,6 +40,20 @@ export function Sidebar() {
     fetch('/api/outreach?status=pending')
       .then(r => r.ok ? r.json() : [])
       .then((drafts: unknown[]) => setOutreachCount(Array.isArray(drafts) ? drafts.length : 0))
+      .catch(() => {});
+    fetch('/api/meetings')
+      .then(r => r.ok ? r.json() : { meetings: [] })
+      .then((data: { meetings?: { state: string; start_iso: string | null; notes?: string; thank_you_sent?: boolean }[] }) => {
+        const list = data.meetings || [];
+        const now = Date.now();
+        const weekEnd = now + 7 * 24 * 60 * 60 * 1000;
+        const upcoming = list.filter(m =>
+          m.state === 'confirmed' && m.start_iso && new Date(m.start_iso).getTime() <= weekEnd && new Date(m.start_iso).getTime() > now - 60 * 60 * 1000
+        ).length;
+        const proposed = list.filter(m => m.state === 'proposed').length;
+        const followUp = list.filter(m => m.state === 'completed' && (!m.notes || !m.thank_you_sent)).length;
+        setMeetingsCount(upcoming + proposed + followUp);
+      })
       .catch(() => {});
   }, [pathname]);
 
@@ -110,6 +126,17 @@ export function Sidebar() {
                   }}
                 >
                   {calendarCount}
+                </span>
+              )}
+              {item.badge === 'meetings' && meetingsCount > 0 && (
+                <span
+                  style={{
+                    background: '#5B4FE8', color: 'white',
+                    fontSize: 10, padding: '2px 7px', borderRadius: 999,
+                    minWidth: 18, textAlign: 'center', lineHeight: 1.3,
+                  }}
+                >
+                  {meetingsCount}
                 </span>
               )}
               {item.badge === 'outreach' && outreachCount > 0 && (

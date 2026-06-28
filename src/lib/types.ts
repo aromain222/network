@@ -102,6 +102,8 @@ export type GenerateResponse = {
 
 export type ReplyResponse = {
   reply: string;
+  subject?: string;
+  email_to?: string;
   reply_type: string;
   person: { name: string; company: string; role: string };
   available_slots?: { date: string; day: string; time: string }[];

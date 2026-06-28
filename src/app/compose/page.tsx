@@ -4,10 +4,86 @@ import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { Copy, Check, Loader2, FileText, Send, MessageSquare, Mail, Upload, RefreshCw, ArrowRight, UserCheck, CalendarCheck, HelpCircle, Clock, CalendarPlus } from 'lucide-react';
 import type { Contact, ContactStatus, GenerateResponse, ReplyResponse } from '@/lib/types';
-import { extractLatestInboundMessage } from '@/lib/scheduling';
+import { buildSchedulingProse, extractLatestInboundMessage, naturalizeSlotDay } from '@/lib/scheduling';
 
 export default function ComposePage() {
   return <Suspense><ComposeInner /></Suspense>;
+}
+
+const MONTH_MAP: Record<string, number> = {
+  jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3,
+  may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7,
+  sep: 8, september: 8, oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11,
+};
+
+const TZ_OFFSET_HOURS: Record<string, number> = {
+  PT: -8, PST: -8, PDT: -7,
+  MT: -7, MST: -7, MDT: -6,
+  CT: -6, CST: -6, CDT: -5,
+  ET: -5, EST: -5, EDT: -4,
+  UTC: 0, GMT: 0,
+};
+
+// Convert a wall-clock time in a given IANA-ish timezone abbreviation to a UTC ISO string.
+function tzToUtcIso(year: number, month: number, day: number, hour: number, minute: number, tz: string): string {
+  const offset = TZ_OFFSET_HOURS[tz.toUpperCase()] ?? -8;
+  const utcMillis = Date.UTC(year, month, day, hour - offset, minute, 0);
+  return new Date(utcMillis).toISOString();
+}
+
+type ParsedInvite = {
+  title: string;
+  startIso: string;
+  endIso: string;
+  meetLink: string | null;
+  location: string | null;
+  organizerEmail: string | null;
+};
+
+// Parse a Gmail/Google Calendar invitation email body into structured meeting fields.
+// Handles "Updated invitation: TITLE @ Wed Jun 24, 2026 3pm - 3:30pm (EDT)" style headers.
+function parseCalendarInvite(text: string): ParsedInvite | null {
+  const header = text.match(
+    /(?:Updated invitation|Invitation|Accepted|Declined):\s+(.+?)\s+@\s+(?:\w{3,9},?\s+)?(\w{3,9})\s+(\d{1,2})(?:,?\s+(\d{4}))?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*-\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([A-Z]{2,4})\)/i,
+  );
+  if (!header) return null;
+  const [, rawTitle, monthName, dayStr, yearStr, sHourStr, sMinStr, sAmPm, eHourStr, eMinStr, eAmPm, tz] = header;
+  const month = MONTH_MAP[monthName.toLowerCase()];
+  if (month === undefined) return null;
+  const day = parseInt(dayStr);
+  const year = yearStr ? parseInt(yearStr) : new Date().getFullYear();
+  const endAmPm = eAmPm.toLowerCase();
+  const startAmPm = (sAmPm || endAmPm).toLowerCase();
+  let sHour = parseInt(sHourStr);
+  let eHour = parseInt(eHourStr);
+  if (startAmPm === 'pm' && sHour !== 12) sHour += 12;
+  if (startAmPm === 'am' && sHour === 12) sHour = 0;
+  if (endAmPm === 'pm' && eHour !== 12) eHour += 12;
+  if (endAmPm === 'am' && eHour === 12) eHour = 0;
+  const sMin = sMinStr ? parseInt(sMinStr) : 0;
+  const eMin = eMinStr ? parseInt(eMinStr) : 0;
+
+  const startIso = tzToUtcIso(year, month, day, sHour, sMin, tz);
+  const endIso = tzToUtcIso(year, month, day, eHour, eMin, tz);
+
+  const linkMatch = text.match(/(https?:\/\/(?:[a-z0-9-]+\.)*(?:zoom\.us\/j\/|meet\.google\.com\/|teams\.microsoft\.com\/)[^\s>]+)/i);
+  const organizerMatch = text.match(/([A-Z0-9._+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\s*-\s*Organizer/i);
+
+  let location: string | null = null;
+  if (linkMatch) {
+    const url = linkMatch[1];
+    if (/zoom\.us/i.test(url)) location = 'Zoom';
+    else if (/meet\.google\.com/i.test(url)) location = 'Google Meet';
+    else if (/teams\.microsoft\.com/i.test(url)) location = 'Microsoft Teams';
+  }
+
+  return {
+    title: rawTitle.trim(),
+    startIso, endIso,
+    meetLink: linkMatch ? linkMatch[1] : null,
+    location,
+    organizerEmail: organizerMatch ? organizerMatch[1] : null,
+  };
 }
 
 function StreamWords({ text, onDone }: { text: string; onDone?: () => void }) {
@@ -88,9 +164,10 @@ function ComposeInner() {
   const [showMeetingForm, setShowMeetingForm] = useState(false);
   const [meetingForm, setMeetingForm] = useState({ date: '', time: '', location: '', notes: '' });
   const [meetingSaved, setMeetingSaved] = useState(false);
-  const [availableSlots, setAvailableSlots] = useState<{ date: string; day: string; time: string }[]>([]);
+  const [availableSlots, setAvailableSlots] = useState<{ date: string; day: string; time: string; hour: number; minute: number }[]>([]);
   const [findingTimes, setFindingTimes] = useState(false);
   const [confirmedTime, setConfirmedTime] = useState<{ date: string; time: string } | null>(null);
+  const [inviteSyncState, setInviteSyncState] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
 
   useEffect(() => {
     fetch('/api/contacts').then(r => r.json()).then(setContacts).catch(() => {});
@@ -149,6 +226,51 @@ function ComposeInner() {
 
   const hasSchedulingLanguage = /\b(call|meet|zoom|google meet|schedule|tuesday|wednesday|thursday|friday|monday|next week|this week|coffee|lunch|dinner|evening|afternoon|morning|time|slot)\b/i.test(latestInbound.text);
   const askingForTimes = /\b(what time|when are you|pick a time|availability|schedule a call|when works|your schedule|free time|available|can you make|could you do)\b/i.test(latestInbound.text);
+  // Calendar invite / update notification — the meeting is already on Google Cal,
+  // so the manual "Schedule Meeting" form is noise. A Sync will pull it.
+  const isCalendarInvite =
+    /\b(updated invitation:|invitation:|this event has been (updated|cancelled|canceled|rescheduled)|on your google calendar|added to (your )?google calendar|google calendar invitation|calendar\.google\.com)\b/i.test(reply)
+    || (/\b(zoom\.us\/j\/|meet\.google\.com\/[a-z-]+)\b/i.test(reply) && /\borganizer\b/i.test(reply));
+
+  const lastSyncedInvite = useRef<string>('');
+  useEffect(() => {
+    if (!isCalendarInvite || !reply.trim()) return;
+    const key = reply.trim().slice(0, 200);
+    if (lastSyncedInvite.current === key) return;
+    lastSyncedInvite.current = key;
+    setInviteSyncState('syncing');
+
+    const parsed = parseCalendarInvite(reply);
+    if (!parsed) {
+      // Fall back to Google sync if we couldn't parse the invite text
+      fetch('/api/meetings/sync', { method: 'POST' })
+        .then(r => r.ok ? r.json() : Promise.reject(r))
+        .then(() => setInviteSyncState('synced'))
+        .catch(() => setInviteSyncState('error'));
+      return;
+    }
+
+    const cid = matchedContact?.id
+      || (parsed.organizerEmail ? contacts.find(c => c.notes?.toLowerCase().includes(parsed.organizerEmail!.toLowerCase()))?.id : null)
+      || manualContactId
+      || null;
+
+    fetch('/api/meetings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'manual',
+        title: parsed.title,
+        contact_id: cid,
+        start_iso: parsed.startIso,
+        end_iso: parsed.endIso,
+        location: parsed.location,
+        meet_link: parsed.meetLink,
+      }),
+    })
+      .then(r => r.ok ? r.json() : Promise.reject(r))
+      .then(() => setInviteSyncState('synced'))
+      .catch(() => setInviteSyncState('error'));
+  }, [isCalendarInvite, reply, matchedContact?.id, manualContactId, contacts]);
 
   const findAvailableTimes = useCallback(async () => {
     setFindingTimes(true);
@@ -240,14 +362,10 @@ function ComposeInner() {
     return { date: displayDate, isoDate, time: timeStr, platform, tz };
   }
 
-  // Detect from EITHER the AI-drafted reply OR the inbound reply.
-  // The draft is most reliable: short and distilled. Trust it first.
-  // For inbound, skip if it looks like a pasted thread (multi-line, many timestamps)
-  // since those are full of weekday labels and message timestamps the detector confuses with meetings.
-  const inboundLines = reply.split('\n').filter(l => l.trim()).length;
-  const looksLikePastedThread = inboundLines > 6;
+  // Detect a confirmed meeting from EITHER the AI-drafted reply OR the latest inbound
+  // message (NOT the full pasted thread — earlier messages/timestamps fool the regex).
   const detectedFromDraft = replyResult?.reply ? detectMeetingDetails(replyResult.reply) : null;
-  const detectedFromReply = reply.trim() && !askingForTimes && !looksLikePastedThread ? detectMeetingDetails(reply) : null;
+  const detectedFromReply = latestInbound.text && !askingForTimes ? detectMeetingDetails(latestInbound.text) : null;
   const detectedMeeting = detectedFromDraft || detectedFromReply;
   const detectedConfirmation = detectedMeeting ? { date: detectedMeeting.date, time: detectedMeeting.time } : null;
 
@@ -402,6 +520,33 @@ function ComposeInner() {
             body: reply.trim(),
           }),
         }).catch(() => {});
+      }
+
+      // Auto-track proposed times so they surface on /meetings as "Awaiting confirmation"
+      if (cid && Array.isArray(data.available_slots) && data.available_slots.length > 0) {
+        const proposed_times = data.available_slots
+          .map((s: { date: string; time: string }) => {
+            const tm = String(s.time).match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+            if (!tm) return null;
+            let h = parseInt(tm[1]);
+            const m = tm[2] ? parseInt(tm[2]) : 0;
+            const ampm = tm[3]?.toLowerCase();
+            if (ampm === 'pm' && h !== 12) h += 12;
+            if (ampm === 'am' && h === 12) h = 0;
+            return new Date(`${s.date}T${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00`).toISOString();
+          })
+          .filter(Boolean) as string[];
+        if (proposed_times.length > 0) {
+          fetch('/api/meetings', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              kind: 'proposed',
+              contact_id: cid,
+              title: `Call with ${matchedContact?.name || 'contact'}`,
+              proposed_times,
+            }),
+          }).catch(() => {});
+        }
       }
     } catch (err) { setError(err instanceof Error ? err.message : 'Error'); }
     finally { setLoading(false); }
@@ -614,15 +759,22 @@ function ComposeInner() {
                     {availableSlots.map((slot, i) => (
                       <div key={i} className="flex items-center gap-2 text-xs text-primary">
                         <CalendarPlus size={11} className="text-accent" />
-                        <span>{slot.day}</span>
+                        <span>{naturalizeSlotDay(slot.day)}</span>
                       </div>
                     ))}
                   </div>
                   <button
                     onClick={() => {
                       const name = matchedContact?.name?.split(' ')[0] || 'there';
-                      const times = availableSlots.map(s => `• ${s.day}`).join('\n');
-                      setContext(prev => `${prev ? prev + '\n' : ''}Propose these times:\n${times}`);
+                      const wantsET = /\b(et|est|edt|eastern)\b/i.test(`${reply} ${context}`);
+                      const prose = buildSchedulingProse(name, availableSlots, wantsET);
+                      setReplyResult({
+                        reply: prose,
+                        reply_type: 'availability',
+                        person: { name: matchedContact?.name || '', company: matchedContact?.company || '', role: matchedContact?.role || '' },
+                        available_slots: availableSlots,
+                        calendar_checked: true,
+                      });
                     }}
                     className="w-full flex items-center justify-center gap-1.5 bg-accent text-white px-3 py-2 text-[11px] hover:bg-accent/90 transition-colors cursor-pointer mt-1"
                   >
@@ -631,24 +783,41 @@ function ComposeInner() {
                 </div>
               )}
 
-              {detectedConfirmation && (matchedContact || manualContactId) && !meetingSaved && (
+              {isCalendarInvite ? (
+                <div className="flex items-center justify-center gap-2 border border-green/30 bg-green/5 px-4 py-2.5 text-[11px] text-green shrink-0">
+                  {inviteSyncState === 'syncing' && <><Loader2 size={13} className="animate-spin" /> Adding to your in-app calendar…</>}
+                  {inviteSyncState === 'synced' && <><CalendarCheck size={13} /> Added to your in-app calendar — check <a href="/meetings" className="underline">Meetings</a></>}
+                  {inviteSyncState === 'error' && <><CalendarCheck size={13} /> Sync failed — open <a href="/meetings" className="underline">Meetings</a> and retry</>}
+                  {inviteSyncState === 'idle' && <><CalendarCheck size={13} /> Detected a Google Calendar invite — syncing…</>}
+                </div>
+              ) : detectedConfirmation && (matchedContact || manualContactId) && !meetingSaved && (
                 <button
                   onClick={() => {
                     const cid = matchedContact?.id || manualContactId;
+                    void cid;
                     const cName = matchedContact?.name || contacts.find(c => c.id === manualContactId)?.name || '';
-                    setMeetingForm({ date: detectedConfirmation.date, time: detectedConfirmation.time, location: 'Google Meet', notes: `Call with ${cName}` });
+                    const isoDate = detectedMeeting?.isoDate || '';
+                    setMeetingForm({ date: isoDate, time: detectedConfirmation.time, location: detectedMeeting?.platform || 'Google Meet', notes: `Call with ${cName}` });
                     setShowMeetingForm(true);
                   }}
-                  className="flex items-center justify-center gap-2 border border-green/30 bg-green/5 px-4 py-2.5 text-[11px] text-green hover:bg-green/10 transition-colors cursor-pointer shrink-0"
+                  className="flex items-center justify-center gap-2 bg-green text-white px-4 py-3 text-xs hover:bg-green/90 transition-colors cursor-pointer shrink-0"
                 >
-                  <CalendarPlus size={13} /> Create Calendar Event — {detectedConfirmation.date} at {detectedConfirmation.time}
+                  <CalendarPlus size={14} /> Add to Calendar — {detectedConfirmation.date} at {detectedConfirmation.time}
                 </button>
               )}
 
               <div className="flex gap-2 shrink-0">
-                <button onClick={() => handleReply(false)} disabled={loading || !reply.trim()} className="flex-1 flex items-center justify-center gap-2 bg-accent px-4 py-3 text-xs text-white hover:bg-accent/90 disabled:opacity-40 transition-colors cursor-pointer">
+                <button
+                  onClick={() => handleReply(false)}
+                  disabled={loading || !reply.trim()}
+                  className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 text-xs transition-colors cursor-pointer disabled:opacity-40 ${
+                    detectedConfirmation
+                      ? 'border border-edge text-secondary hover:text-primary'
+                      : 'bg-accent text-white hover:bg-accent/90'
+                  }`}
+                >
                   {loading ? <Loader2 size={14} className="animate-spin" /> : <MessageSquare size={14} />}
-                  {loading ? 'Drafting...' : 'Draft Reply'}
+                  {loading ? 'Drafting...' : detectedConfirmation ? 'Draft a quick confirmation' : 'Draft Reply'}
                 </button>
                 {detectedEmail && (
                   <button onClick={() => handleReply(true)} disabled={loading} className="flex items-center gap-2 border border-edge px-4 py-3 text-xs text-secondary hover:text-primary transition-colors cursor-pointer">
@@ -717,14 +886,29 @@ function ComposeInner() {
               <div className="border border-edge bg-elevated p-5 flex-1 flex flex-col gap-3">
                 <div className="flex items-center justify-between shrink-0">
                   <span className="rounded-full bg-accent/15 text-accent px-2.5 py-0.5 text-[10px]">{replyResult.reply_type}</span>
-                  <button onClick={() => { copy(replyResult.reply, 99); logSentReply(replyResult.reply); }} className="flex items-center gap-1 text-[10px] text-secondary hover:text-primary cursor-pointer">
-                    {copied === 99 ? <><Check size={11} className="text-green" /> Copied</> : <><Copy size={11} /> Copy</>}
+                  <button
+                    onClick={() => {
+                      const fullEmail = replyResult.subject
+                        ? `${replyResult.email_to ? `To: ${replyResult.email_to}\n` : ''}Subject: ${replyResult.subject}\n\n${replyResult.reply}`
+                        : replyResult.reply;
+                      copy(fullEmail, 99);
+                      logSentReply(replyResult.reply);
+                    }}
+                    className="flex items-center gap-1 text-[10px] text-secondary hover:text-primary cursor-pointer"
+                  >
+                    {copied === 99 ? <><Check size={11} className="text-green" /> Copied</> : <><Copy size={11} /> {replyResult.subject ? 'Copy email' : 'Copy'}</>}
                   </button>
                 </div>
+                {(replyResult.subject || replyResult.email_to) && (
+                  <div className="rounded border border-edge/70 bg-bg/60 px-3 py-2 text-[11px] text-secondary space-y-1">
+                    {replyResult.email_to && <div><span className="text-muted">To:</span> {replyResult.email_to}</div>}
+                    {replyResult.subject && <div><span className="text-muted">Subject:</span> {replyResult.subject}</div>}
+                  </div>
+                )}
                 <p className="text-[13px] text-primary/90 whitespace-pre-wrap leading-[1.7] flex-1">{replyResult.reply}</p>
               </div>
 
-              {hasSchedulingLanguage && (matchedContact || manualContactId) && !meetingSaved && (
+              {hasSchedulingLanguage && !isCalendarInvite && (matchedContact || manualContactId) && !meetingSaved && (
                 !showMeetingForm ? (
                   <button
                     onClick={() => {

@@ -14,8 +14,9 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  // Manual triggers force a fresh batch by default; cron continues to top up.
-  let force = true;
+  // Manual triggers top up today's list by default. Send { force: true } only when
+  // you intentionally want to replace the current discovery batch.
+  let force = false;
   try {
     if (request.headers.get('content-type')?.includes('json')) {
       const body = await request.json();

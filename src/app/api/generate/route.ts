@@ -272,6 +272,8 @@ ${body.profile}${contextLine}`;
 
   const userContent = `Write EXACTLY FOUR first-touch LinkedIn messages using the completed profile analysis below. Each one takes a different angle so Avery can pick what fits.
 
+Important product goal: Avery likes the outreach quality, but he does NOT want every option to feel over-researched. Give him one clearly personalized option, then give him a few options that are still interested, warm, and specific to the broad role/field, but generic enough that they don't feel like he studied the person's whole profile.
+
 PROFILE ANALYSIS:
 ${JSON.stringify(analysis)}
 
@@ -283,9 +285,9 @@ RECIPIENT STATUS:
 WRITING CONTRACT:
 - Return EXACTLY 4 options with these exact labels in this order:
   1. "Type 1 — Personalized"  (hook-led + one specific career fact + one related question)
-  2. "Type 2 — Hook-only"     (hook-led, short, no specific recipient detail)
-  3. "Type 3 — Curiosity"     (NO hook required — one honest curiosity question about their work that any student could ask)
-  4. "Type 4 — Direct ask"    (super short: who Avery is + a direct 15-min ask, no preamble)
+  2. "Type 2 — Hook-only"     (generic but interested: hook-led, short, no specific recipient detail)
+  3. "Type 3 — Curiosity"     (generic but not bland: one broad honest question about their role/field)
+  4. "Type 4 — Direct ask"    (super short: who Avery is + direct ask, no researched detail)
 - Word counts: Type 1 ≤ 90 words. Type 2 ≤ 60 words. Type 3 ≤ 70 words. Type 4 ≤ 35 words.
 
 HOOK RULE (highest priority — violating this is a bug):
@@ -313,8 +315,16 @@ ${aiMurjRule}
 
 PERSONALIZATION RULES:
 - Type 1 — Personalized: reference ONE broad fact about their career (current role, recent company change, the field they work in). Do NOT reference hyper-specific technical details from the profile — no OCR layers, chunking strategies, FHIR pipelines, eval setups, embedding models, retrieval methods, agent frameworks, or anything Avery would not plausibly know from building CapitalBase or interning at Murj.
-- Type 2 — Generic: NO specific recipient-profile detail. Use only the shared hook plus Avery's honest curiosity. Plain words.
-- Type 1 must STILL feel like Avery, not a researcher. If the detail makes the note feel performative, drop it and lean harder on the hook.
+- Type 2 — Hook-only: NO specific recipient-profile detail. Use only the shared hook plus a warm, low-pressure reason to connect. It should still feel interested, not like a template.
+- Type 3 — Curiosity: NO specific recipient-profile detail and NO shared-hook dependency. Use a broad role/field curiosity Avery would genuinely have. Good examples: "I'm trying to understand what customer-facing AI roles look like up close" or "I'm curious how people in fintech infrastructure think about the customer side." Bad examples: "your path," "your experience," or any detailed profile recap.
+- Type 4 — Direct ask: NO specific recipient-profile detail. No researched detail. No hook required. Just a clean, confident ask.
+- Type 1 must STILL feel like Avery, not a researcher. If the detail makes the note feel performative, drop it and lean harder on the broad career/role hook.
+
+GENERIC BUT INTERESTED STYLE:
+- Generic options should sound like Avery is genuinely curious about their world, not like he is pretending to know their work deeply.
+- It is okay for Type 2/3/4 to be broadly applicable to people in the same role/field.
+- Avoid empty generic lines like "always looking to connect" or "doing interesting work." Generic does not mean lazy.
+- Prefer broad but real angles: customer-facing AI roles, fintech infrastructure, building with customers, investing in AI/fintech, moving from school/athletics into tech or finance.
 
 CTA RULE (don't combine):
 - The message ends with EXACTLY ONE of: "Would you be open to connecting?" / "Would you be open to a quick chat?" / "Would you be open to a quick conversation?"
